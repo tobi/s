@@ -83,7 +83,7 @@ usage:
   s run <cmd> [args...]         run cmd with ALL secrets injected
 
 secrets:
-  s set <NAME>                  set a secret (interactive, hidden)
+  s set <NAME>                  set a secret (interactive, masked)
   s set <NAME> --stdin          set from stdin
   s get <NAME>                  show decrypted value (human debugging)
   s rm <NAME>                   delete a secret
@@ -284,14 +284,7 @@ fn cmd_set(args: &[String]) -> Result<()> {
     if positional.is_empty() {
         bail!("usage: s set <NAME> [--stdin]");
     }
-    let arg = &positional[0];
-
-    if let Some((k, v)) = arg.split_once('=') {
-        if !store::valid_key_name(k) { bail!("invalid key: {k:?}") }
-        return set_key_value(k, v, force);
-    }
-
-    let key = arg.as_str();
+    let key = &positional[0];
     if !store::valid_key_name(key) { bail!("invalid key: {key:?}") }
 
     let value = if from_stdin {
@@ -299,9 +292,96 @@ fn cmd_set(args: &[String]) -> Result<()> {
         io::stdin().read_to_string(&mut buf).context("reading stdin")?;
         buf.trim_end_matches('\n').to_string()
     } else {
-        rpassword::prompt_password(&format!("{key}: ")).context("reading value")?
+        read_secret_interactive(key)?
     };
     set_key_value(key, &value, force)
+}
+
+/// Read a secret value interactively, echoing `*` for each character.
+fn read_secret_interactive(key: &str) -> Result<String> {
+    use std::io::BufReader;
+
+    let tty = std::fs::OpenOptions::new()
+        .read(true).write(true).open("/dev/tty")
+        .context("no TTY available — use --stdin")?;
+    let mut tty_w = tty.try_clone()?;
+    write!(tty_w, "{key}: ")?;
+    tty_w.flush()?;
+
+    // Raw mode: read char by char
+    let fd = {
+        use std::os::fd::AsRawFd;
+        tty.as_raw_fd()
+    };
+    let orig = unsafe {
+        let mut t: libc_termios = std::mem::zeroed();
+        tcgetattr(fd, &mut t);
+        t
+    };
+    let mut raw = orig;
+    // Disable echo and canonical mode
+    raw.c_lflag &= !(0o10 | 0o2); // ~(ECHO | ICANON)
+    raw.c_cc[16] = 1; // VMIN = 1
+    raw.c_cc[17] = 0; // VTIME = 0
+    unsafe { tcsetattr(fd, 0, &raw) };
+
+    let mut value = String::new();
+    let mut reader = BufReader::new(&tty);
+    let mut byte = [0u8; 1];
+    loop {
+        use std::io::Read;
+        match reader.read(&mut byte) {
+            Ok(1) => {
+                match byte[0] {
+                    b'\n' | b'\r' => break,
+                    127 | 8 => { // backspace / delete
+                        if !value.is_empty() {
+                            value.pop();
+                            let _ = write!(tty_w, "\x08 \x08");
+                            let _ = tty_w.flush();
+                        }
+                    }
+                    3 => { // Ctrl-C
+                        unsafe { tcsetattr(fd, 0, &orig) };
+                        let _ = writeln!(tty_w);
+                        bail!("aborted");
+                    }
+                    c if c >= 32 => {
+                        value.push(c as char);
+                        let _ = write!(tty_w, "*");
+                        let _ = tty_w.flush();
+                    }
+                    _ => {} // ignore other control chars
+                }
+            }
+            _ => break,
+        }
+    }
+
+    unsafe { tcsetattr(fd, 0, &orig) };
+    let _ = writeln!(tty_w);
+
+    if value.is_empty() {
+        bail!("empty value");
+    }
+    Ok(value)
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct libc_termios {
+    c_iflag: u64,
+    c_oflag: u64,
+    c_cflag: u64,
+    c_lflag: u64,
+    c_cc: [u8; 20],
+    c_ispeed: u64,
+    c_ospeed: u64,
+}
+
+extern "C" {
+    fn tcgetattr(fd: i32, t: *mut libc_termios) -> i32;
+    fn tcsetattr(fd: i32, action: i32, t: *const libc_termios) -> i32;
 }
 
 fn set_key_value(key: &str, value: &str, force: bool) -> Result<()> {
