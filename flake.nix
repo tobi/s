@@ -37,14 +37,17 @@
         devShells.default = pkgs.mkShell {
           packages = with pkgs; [ cargo rustc rustfmt clippy ];
         };
-
-        # Home Manager module
-        homeModules.default = { config, lib, pkgs, ... }:
-          let
-            cfg = config.programs.s;
-          in
-          {
-            options.programs.s = {
+      })
+    //
+    {
+      # Home Manager module (system-independent, must be top-level)
+      homeModules.default = { config, lib, pkgs, ... }:
+        let
+          s = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
+          cfg = config.programs.s;
+        in
+        {
+          options.programs.s = {
               enable = lib.mkEnableOption "s — encrypted env store";
 
               package = lib.mkOption {
@@ -65,14 +68,14 @@
               };
             };
 
-            config = lib.mkIf cfg.enable {
-              home.packages = [ cfg.package ];
+          config = lib.mkIf cfg.enable {
+            home.packages = [ cfg.package ];
 
-              # Set S_KEY in the session environment
-              home.sessionVariables = lib.mkIf (cfg.passwordCommand != null) {
-                S_KEY = "!${cfg.passwordCommand}";
-              };
+            # Set S_KEY in the session environment
+            home.sessionVariables = lib.mkIf (cfg.passwordCommand != null) {
+              S_KEY = "!${cfg.passwordCommand}";
             };
           };
-      });
+        };
+    };
 }
