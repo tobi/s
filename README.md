@@ -38,6 +38,38 @@ s run ./deploy.sh                                # ALL secrets
 
 Secrets are injected as env vars. Output is scrubbed — any secret value replaced with `[REDACTED]`.
 
+## Inline / shebang mode
+
+Scripts can declare their own secret dependencies in the shebang, so callers and agents do not need to remember to wrap them with `s`:
+
+```bash
+#!/usr/bin/env -S s TOOL_GATEWAY_TOKEN -- bash
+curl -H "Authorization: Bearer $TOOL_GATEWAY_TOKEN" https://example.com
+```
+
+Multiple secrets work the same way:
+
+```bash
+#!/usr/bin/env -S s SCRAPECREATORS_API_KEY X_BEARER_TOKEN -- bun
+console.log(process.env.SCRAPECREATORS_API_KEY ? "ready" : "missing")
+```
+
+On systems where `s` has a stable absolute path, direct shebangs work too:
+
+```bash
+#!/usr/local/bin/s API_KEY -- python3
+import os
+print("API_KEY is present" if os.environ.get("API_KEY") else "missing")
+```
+
+This is equivalent to running `s KEY [KEY...] -- <interpreter> <script> ...`: the named secrets are injected into the interpreter process and scrubbed from stdout/stderr. The script's arguments are preserved.
+
+Operational notes:
+
+- The process still needs the password via `S_KEY`, `S_KEY="!command"`, or an interactive prompt.
+- `s` reads `.senv` from the current working directory. Run tools from the repo/workspace that owns the `.senv`, or have a wrapper `cd` there first.
+- Prefer shebang mode for committed tools: the tool declares what it needs, while callers simply run `bin/tool ...`.
+
 ## Import / Export
 
 ```bash
