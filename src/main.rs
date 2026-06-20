@@ -29,7 +29,8 @@ fn main() {
 }
 
 fn run() -> Result<()> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    expand_inline_shebang_args(&mut args);
     if args.is_empty() {
         print_usage();
         return Ok(());
@@ -82,6 +83,11 @@ usage:
   s KEY [KEY...] -- <cmd>       run cmd with specific secrets injected
   s run <cmd> [args...]         run cmd with ALL secrets injected
 
+inline / shebang mode:
+  #!/usr/bin/env -S s KEY [KEY...] -- python3
+  #!/usr/local/bin/s KEY [KEY...] -- python3
+                                inject secrets into scripts automatically
+
 secrets:
   s set <NAME>                  set a secret (interactive, masked)
   s set <NAME> --stdin          set from stdin
@@ -113,6 +119,25 @@ password (one of):
   S_KEY=\"!cmd\"                  execute cmd to get password
   TTY prompt                    fallback if interactive"
     );
+}
+
+/// Linux shebangs pass everything after the interpreter path as one argv string.
+/// This lets scripts use inline mode directly:
+///   #!/usr/local/bin/s API_KEY -- python3
+/// as well as the portable env form:
+///   #!/usr/bin/env -S s API_KEY -- python3
+fn expand_inline_shebang_args(args: &mut Vec<String>) {
+    let Some(first) = args.first() else { return; };
+    if !first.contains("--") || !first.contains(char::is_whitespace) {
+        return;
+    }
+
+    let mut expanded: Vec<String> = first
+        .split_whitespace()
+        .map(|s| s.to_string())
+        .collect();
+    expanded.extend(args.iter().skip(1).cloned());
+    *args = expanded;
 }
 
 /// Returns true if stdout is connected to a TTY (human at terminal).
