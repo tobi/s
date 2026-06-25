@@ -33,10 +33,16 @@ s list                          # list names ([REDACTED] values)
 ```bash
 s API_KEY -- curl https://...                    # specific secrets
 s API_KEY DB_URL -- ./deploy.sh                  # multiple secrets
-s run ./deploy.sh                                # ALL secrets
+s --all -- ./deploy.sh                           # ALL secrets (explicit)
+s -- ./build.sh                                  # no secrets injected
 ```
 
-Secrets are injected as env vars. Output is scrubbed — any secret value replaced with `[REDACTED]`.
+Secrets are injected as env vars. Output is scrubbed — any secret value replaced
+with `[REDACTED]`. Injecting **all** secrets is never the default: name the keys
+you need, or opt in explicitly with `--all`.
+
+Scrubbing is verbatim-only: it catches the secret as written, not transformed
+copies (base64, URL-encoding, etc.). It's a strong guardrail, not a guarantee.
 
 ## Inline / shebang mode
 
@@ -101,6 +107,23 @@ Checks actual secret values — no regex, no false positives.
 
 `s init` installs a pre-commit hook that runs `s scan --staged` automatically.
 
+## Store location
+
+`s` resolves which `.senv` to use in this order:
+
+1. `S_FILE` env var — explicit path override (used for reads and writes)
+2. `./.senv` — project-local store in the current directory
+3. `~/.config/senv/senv` — global store (honours `$XDG_CONFIG_HOME`)
+
+When both a local and a global store exist, reads **merge** them with the local
+store winning on conflicts — so a repo can override or extend your global
+secrets. A single password (from `S_KEY` or one prompt) decrypts both. Setting
+`S_FILE` bypasses the merge and uses only that file.
+
+Writes update a key wherever it already lives; brand-new keys are created in the
+highest-precedence existing store. `s init` creates `./.senv` by default, or the
+`S_FILE` path if set (e.g. `S_FILE=~/.config/senv/senv s init` for a global store).
+
 ## Password
 
 The encryption password is resolved in order:
@@ -113,14 +136,16 @@ The encryption password is resolved in order:
 
 - `s get` and `s export` **refuse without a TTY** — prevents secrets leaking into agent context
 - `s list` only shows names with `[REDACTED]`
-- `s run` / `s KEY -- cmd` inject secrets but scrub all output
+- `s KEY -- cmd` / `s --all -- cmd` inject secrets but scrub all output
 - Pre-commit hook blocks committing leaked secret values
 
 ## How it works
 
 - Each secret is independently encrypted with ChaCha20-Poly1305
-- Key derived via HKDF-SHA256 from your password + random per-value salt
-- `.senv` is safe to commit (only encrypted blobs)
+- Key derived with **Argon2id** (memory-hard) from your password + random per-value salt
+- `.senv` is safe to commit (only encrypted blobs); written with `0600` perms
+- Pre-0.7 stores (HKDF-derived) still decrypt; re-encrypting a value upgrades it
+- The master password (`S_KEY`) is stripped from injected subprocess environments
 - No daemon, no network, no SSH keys, no keychain dependency
 
 ## Install

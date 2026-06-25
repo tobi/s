@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::{anyhow, bail, Context, Result};
+use zeroize::Zeroizing;
 
 const STORE_FILE: &str = ".senv";
 const REDACTED: &str = "[REDACTED]";
@@ -46,8 +47,13 @@ fn run() -> Result<()> {
         if cmd_args.is_empty() {
             bail!("missing command after --");
         }
-        if names.is_empty() {
+        // `s --all -- cmd` injects every secret — opt-in only, never the default.
+        if names.len() == 1 && names[0] == "--all" {
             return cmd_exec(cmd_args, None);
+        }
+        // `s -- cmd` with no names injects nothing (safe default).
+        if names.is_empty() {
+            return cmd_exec(cmd_args, Some(&[]));
         }
         if names.iter().all(|n| looks_like_key(n)) {
             return cmd_exec(cmd_args, Some(names));
@@ -60,7 +66,6 @@ fn run() -> Result<()> {
         "get" => cmd_get(&args[1..]),
         "rm" => cmd_rm(&args[1..]),
         "list" | "ls" => cmd_list(&args[1..]),
-        "run" => cmd_run(&args[1..]),
         "import" => cmd_import(&args[1..]),
         "export" => cmd_export(&args[1..]),
         "scan" => cmd_scan(&args[1..]),
@@ -81,7 +86,7 @@ s — encrypted env store. your agent doesn't need to know your secrets.
 
 usage:
   s KEY [KEY...] -- <cmd>       run cmd with specific secrets injected
-  s run <cmd> [args...]         run cmd with ALL secrets injected
+  s --all -- <cmd>              run cmd with ALL secrets injected
 
 inline / shebang mode:
   #!/usr/bin/env -S s KEY [KEY...] -- python3
@@ -114,6 +119,11 @@ scanning:
 setup:
   s init                        create .senv + install pre-commit hook
 
+store location (precedence):
+  S_FILE env var                explicit store path (overrides the rest)
+  ./.senv                       project-local store
+  ~/.config/senv/senv           global store (merged under local; local wins)
+
 password (one of):
   S_KEY env var                 the password directly
   S_KEY=\"!cmd\"                  execute cmd to get password
@@ -143,11 +153,8 @@ fn expand_inline_shebang_args(args: &mut Vec<String>) {
 /// Returns true if stdout is connected to a TTY (human at terminal).
 fn is_tty() -> bool {
     use std::os::fd::AsRawFd;
-    unsafe { libc_isatty(io::stdout().as_raw_fd()) != 0 }
+    unsafe { libc::isatty(io::stdout().as_raw_fd()) == 1 }
 }
-
-extern "C" { fn isatty(fd: i32) -> i32; }
-use self::isatty as libc_isatty;
 
 /// Bail if no TTY — prevents secrets from leaking into agent context.
 fn require_tty(action: &str) -> Result<()> {
@@ -164,27 +171,126 @@ fn looks_like_key(s: &str) -> bool {
         && s.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
 }
 
+/// Project-local store in the current directory.
 fn store_path() -> PathBuf {
     PathBuf::from(STORE_FILE)
 }
 
-fn ensure_store() -> Result<PathBuf> {
-    let p = store_path();
-    if !p.exists() {
-        bail!("no {STORE_FILE} here — run `s init` first");
+/// `$S_FILE` if set to a non-empty value — an explicit override of the store
+/// location, used for both reads and writes (including `s init`).
+fn override_store_path() -> Option<PathBuf> {
+    std::env::var_os("S_FILE")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+}
+
+/// Global fallthrough store: `~/.config/senv/senv` (honours `$XDG_CONFIG_HOME`).
+fn global_store_path() -> Option<PathBuf> {
+    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
+        return Some(PathBuf::from(xdg).join("senv/senv"));
     }
-    Ok(p)
+    std::env::var_os("HOME")
+        .filter(|v| !v.is_empty())
+        .map(|h| PathBuf::from(h).join(".config/senv/senv"))
+}
+
+/// Where `s init` should create the store: `$S_FILE` if set, else local `.senv`.
+fn store_path_for_init() -> PathBuf {
+    override_store_path().unwrap_or_else(store_path)
+}
+
+/// Stores to read from, highest precedence first. With `$S_FILE` set, that
+/// file is the *only* store (an explicit override — no global merge).
+/// Otherwise reads merge `./.senv` over `~/.config/senv/senv`, local winning.
+fn read_store_paths() -> Vec<PathBuf> {
+    if let Some(p) = override_store_path() {
+        return if p.exists() { vec![p] } else { Vec::new() };
+    }
+    let mut paths = Vec::new();
+    let local = store_path();
+    if local.exists() {
+        paths.push(local);
+    }
+    if let Some(g) = global_store_path() {
+        if g.exists() {
+            paths.push(g);
+        }
+    }
+    paths
+}
+
+/// The single store that writes target / the existence guard for reads.
+/// Precedence: `$S_FILE` (explicit override), then `./.senv`, then
+/// `~/.config/senv/senv`; first existing wins. New keys land here, while
+/// existing keys are updated wherever they already live (see `store_containing`).
+fn ensure_store() -> Result<PathBuf> {
+    if let Some(p) = override_store_path() {
+        if p.exists() {
+            return Ok(p);
+        }
+        bail!("S_FILE={} does not exist — run `s init` first", p.display());
+    }
+    let local = store_path();
+    if local.exists() {
+        return Ok(local);
+    }
+    if let Some(g) = global_store_path() {
+        if g.exists() {
+            return Ok(g);
+        }
+        bail!(
+            "no {STORE_FILE} here and no global store at {} — run `s init` first",
+            g.display()
+        );
+    }
+    bail!("no {STORE_FILE} here — run `s init` first");
+}
+
+/// Find which store currently holds `key`, searching in read precedence order.
+fn store_containing(key: &str) -> Result<Option<PathBuf>> {
+    for p in read_store_paths() {
+        let f = store::SenvFile::load(&p)?;
+        if f.keys.contains_key(key) {
+            return Ok(Some(p));
+        }
+    }
+    Ok(None)
+}
+
+/// Merge every readable store into one map, local (higher precedence) winning.
+/// This is the single source of truth for all read paths, so one password
+/// decrypts everything.
+fn merged_keys() -> Result<std::collections::BTreeMap<String, store::KeyEntry>> {
+    use std::collections::BTreeMap;
+    if let Some(p) = override_store_path() {
+        if !p.exists() {
+            bail!("S_FILE={} does not exist — run `s init` first", p.display());
+        }
+    }
+    let paths = read_store_paths();
+    let mut merged: BTreeMap<String, store::KeyEntry> = BTreeMap::new();
+    // Apply lowest precedence first so higher-precedence stores overwrite.
+    for p in paths.iter().rev() {
+        let f = store::SenvFile::load(p)?;
+        for (k, v) in f.keys {
+            merged.insert(k, v);
+        }
+    }
+    Ok(merged)
 }
 
 /// Get the password from S_KEY env (supports !command), or prompt on TTY.
-fn get_password() -> Result<String> {
+/// Wrapped in `Zeroizing` so the password is wiped from memory on drop.
+fn get_password() -> Result<Zeroizing<String>> {
     if let Ok(val) = std::env::var("S_KEY") {
         if !val.is_empty() {
-            return resolve_cli_value(&val);
+            return Ok(Zeroizing::new(resolve_cli_value(&val)?));
         }
     }
     // Prompt on TTY
-    rpassword::prompt_password("s password: ").context("reading password from TTY")
+    let pw = rpassword::prompt_password("s password: ")
+        .context("reading password from TTY")?;
+    Ok(Zeroizing::new(pw))
 }
 
 /// If `val` starts with `!`, execute the rest as a shell command.
@@ -213,19 +319,25 @@ fn resolve_cli_value(val: &str) -> Result<String> {
 // --- init -----------------------------------------------------------------
 
 fn cmd_init() -> Result<()> {
-    let path = store_path();
+    let path = store_path_for_init();
     if path.exists() {
         bail!("{} already exists", path.display());
+    }
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
     }
     let file = store::SenvFile::default();
     file.save(&path)?;
     eprintln!("s: created {}", path.display());
 
-    // Install pre-commit hook
-    install_hook()?;
-
-    // Add .senv to .gitignore if not already there
-    ensure_gitignore()?;
+    // Git hook + .gitignore only make sense for a project-local .senv.
+    if path == store_path() {
+        install_hook()?;
+        ensure_gitignore()?;
+    }
 
     Ok(())
 }
@@ -339,16 +451,16 @@ fn read_secret_interactive(key: &str) -> Result<String> {
         tty.as_raw_fd()
     };
     let orig = unsafe {
-        let mut t: libc_termios = std::mem::zeroed();
-        tcgetattr(fd, &mut t);
+        let mut t: libc::termios = std::mem::zeroed();
+        libc::tcgetattr(fd, &mut t);
         t
     };
     let mut raw = orig;
-    // Disable echo and canonical mode
-    raw.c_lflag &= !(0o10 | 0o2); // ~(ECHO | ICANON)
-    raw.c_cc[16] = 1; // VMIN = 1
-    raw.c_cc[17] = 0; // VTIME = 0
-    unsafe { tcsetattr(fd, 0, &raw) };
+    // Disable echo and canonical mode so the password is never displayed.
+    raw.c_lflag &= !(libc::ECHO | libc::ICANON);
+    raw.c_cc[libc::VMIN] = 1;
+    raw.c_cc[libc::VTIME] = 0;
+    unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw) };
 
     let mut value = String::new();
     let mut reader = BufReader::new(&tty);
@@ -367,7 +479,7 @@ fn read_secret_interactive(key: &str) -> Result<String> {
                         }
                     }
                     3 => { // Ctrl-C
-                        unsafe { tcsetattr(fd, 0, &orig) };
+                        unsafe { libc::tcsetattr(fd, libc::TCSANOW, &orig) };
                         let _ = writeln!(tty_w);
                         bail!("aborted");
                     }
@@ -383,7 +495,7 @@ fn read_secret_interactive(key: &str) -> Result<String> {
         }
     }
 
-    unsafe { tcsetattr(fd, 0, &orig) };
+    unsafe { libc::tcsetattr(fd, libc::TCSANOW, &orig) };
     let _ = writeln!(tty_w);
 
     if value.is_empty() {
@@ -392,25 +504,13 @@ fn read_secret_interactive(key: &str) -> Result<String> {
     Ok(value)
 }
 
-#[repr(C)]
-#[derive(Copy, Clone)]
-struct libc_termios {
-    c_iflag: u64,
-    c_oflag: u64,
-    c_cflag: u64,
-    c_lflag: u64,
-    c_cc: [u8; 20],
-    c_ispeed: u64,
-    c_ospeed: u64,
-}
-
-extern "C" {
-    fn tcgetattr(fd: i32, t: *mut libc_termios) -> i32;
-    fn tcsetattr(fd: i32, action: i32, t: *const libc_termios) -> i32;
-}
-
 fn set_key_value(key: &str, value: &str, force: bool) -> Result<()> {
-    let path = ensure_store()?;
+    // Update the key where it already lives (any store); otherwise create it
+    // in the primary writable store.
+    let path = match store_containing(key)? {
+        Some(p) => p,
+        None => ensure_store()?,
+    };
     let mut file = store::SenvFile::load(&path)?;
     if file.keys.contains_key(key) && !force && !confirm_overwrite(key)? {
         bail!("aborted");
@@ -428,9 +528,8 @@ fn cmd_get(args: &[String]) -> Result<()> {
     require_tty("show secret")?;
     if args.is_empty() { bail!("usage: s get <NAME>") }
     let key = &args[0];
-    let path = ensure_store()?;
-    let file = store::SenvFile::load(&path)?;
-    let entry = file.keys.get(key.as_str())
+    let merged = merged_keys()?;
+    let entry = merged.get(key.as_str())
         .ok_or_else(|| anyhow!("key {key} not found"))?;
     let pw = get_password()?;
     let v = store::decrypt_value(entry.value(), &pw)
@@ -442,11 +541,10 @@ fn cmd_get(args: &[String]) -> Result<()> {
 fn cmd_rm(args: &[String]) -> Result<()> {
     if args.is_empty() { bail!("usage: s rm <NAME>") }
     let key = &args[0];
-    let path = ensure_store()?;
+    let path = store_containing(key)?
+        .ok_or_else(|| anyhow!("key {key} not found"))?;
     let mut file = store::SenvFile::load(&path)?;
-    if file.keys.remove(key).is_none() {
-        bail!("key {key} not found");
-    }
+    file.keys.remove(key);
     file.save(&path)?;
     eprintln!("s: removed {key}");
     Ok(())
@@ -460,41 +558,38 @@ fn cmd_list(args: &[String]) -> Result<()> {
         if a == "--json" { json = true }
         else { bail!("unknown flag: {a}") }
     }
-    let path = store_path();
-    if !path.exists() {
-        if json { println!("[]") } else { eprintln!("s: no {STORE_FILE} here") }
-        return Ok(());
-    }
-    let file = store::SenvFile::load(&path)?;
-    if file.keys.is_empty() {
+    // Merged view across local + global (or just $S_FILE), local winning.
+    let keys = match merged_keys() {
+        Ok(m) => m,
+        Err(_) => {
+            if json { println!("[]") } else { eprintln!("s: no {STORE_FILE} here") }
+            return Ok(());
+        }
+    };
+    if keys.is_empty() {
         if json { println!("[]") } else { eprintln!("s: (no secrets)") }
         return Ok(());
     }
     if json {
         print!("[");
-        for (i, k) in file.keys.keys().enumerate() {
+        for (i, k) in keys.keys().enumerate() {
             if i > 0 { print!(",") }
             print!("\"{k}\"");
         }
         println!("]");
     } else {
-        for k in file.keys.keys() {
+        for k in keys.keys() {
             println!("  {k:30} {REDACTED}");
         }
     }
     Ok(())
 }
 
-// --- run / exec -----------------------------------------------------------
-
-fn cmd_run(args: &[String]) -> Result<()> {
-    if args.is_empty() { bail!("usage: s run <command> [args...]") }
-    cmd_exec(args, None)
-}
+// --- exec -----------------------------------------------------------------
 
 fn cmd_exec(cmd_args: &[String], only: Option<&[String]>) -> Result<()> {
-    let path = ensure_store()?;
-    let entries = decrypt_all(&path)?;
+    ensure_store()?;
+    let entries = decrypt_all()?;
 
     let entries: Vec<(String, String)> = match only {
         Some(names) => {
@@ -512,6 +607,9 @@ fn cmd_exec(cmd_args: &[String], only: Option<&[String]>) -> Result<()> {
 
     let mut cmd = Command::new(&cmd_args[0]);
     cmd.args(&cmd_args[1..]);
+    // Don't leak the master password into the child: a spawned command (or the
+    // agent driving it) could otherwise read $S_KEY and exfiltrate it.
+    cmd.env_remove("S_KEY");
     for (k, v) in &entries {
         cmd.env(k, v);
     }
@@ -646,7 +744,7 @@ fn is_boring_env(k: &str) -> bool {
 
 fn cmd_export(args: &[String]) -> Result<()> {
     require_tty("export secrets")?;
-    let path = ensure_store()?;
+    ensure_store()?;
     let mut out_file: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
@@ -660,7 +758,7 @@ fn cmd_export(args: &[String]) -> Result<()> {
         }
         i += 1;
     }
-    let entries = decrypt_all(&path)?;
+    let entries = decrypt_all()?;
     let mut output = String::new();
     for (k, v) in &entries {
         if v.contains(' ') || v.contains('"') || v.contains('\'') || v.contains('#') {
@@ -671,7 +769,9 @@ fn cmd_export(args: &[String]) -> Result<()> {
         }
     }
     if let Some(f) = out_file {
-        std::fs::write(&f, &output).with_context(|| format!("writing {f}"))?;
+        // Plaintext on disk — restrict to owner read/write.
+        store::write_private(Path::new(&f), output.as_bytes())
+            .with_context(|| format!("writing {f}"))?;
         eprintln!("s: exported {} secret(s) to {f}", entries.len());
     } else {
         print!("{output}");
@@ -684,9 +784,8 @@ fn cmd_export(args: &[String]) -> Result<()> {
 fn cmd_history(args: &[String]) -> Result<()> {
     if args.is_empty() { bail!("usage: s history <NAME>") }
     let key = &args[0];
-    let path = ensure_store()?;
-    let file = store::SenvFile::load(&path)?;
-    let entry = file.keys.get(key.as_str())
+    let merged = merged_keys()?;
+    let entry = merged.get(key.as_str())
         .ok_or_else(|| anyhow!("key {key} not found"))?;
     println!("history for {key}\n");
     println!("  ● current (active)");
@@ -721,7 +820,8 @@ fn cmd_rollback(args: &[String]) -> Result<()> {
     }
     let key = key.ok_or_else(|| anyhow!("usage: s rollback <NAME> --to N"))?;
     let n = to.ok_or_else(|| anyhow!("usage: s rollback <NAME> --to N"))?;
-    let path = ensure_store()?;
+    let path = store_containing(&key)?
+        .ok_or_else(|| anyhow!("key {key} not found"))?;
     let mut file = store::SenvFile::load(&path)?;
     let entry = file.keys.get_mut(key.as_str())
         .ok_or_else(|| anyhow!("key {key} not found"))?;
@@ -734,7 +834,7 @@ fn cmd_rollback(args: &[String]) -> Result<()> {
 // --- scan -----------------------------------------------------------------
 
 fn cmd_scan(args: &[String]) -> Result<()> {
-    let path = ensure_store()?;
+    ensure_store()?;
     let mut staged = false;
     let mut scan_path: Option<String> = None;
     let mut i = 0;
@@ -751,7 +851,7 @@ fn cmd_scan(args: &[String]) -> Result<()> {
         i += 1;
     }
 
-    let entries = decrypt_all(&path)?;
+    let entries = decrypt_all()?;
     let secrets: Vec<(&str, &str)> = entries.iter()
         .filter(|(_, v)| !v.is_empty())
         .map(|(k, v)| (k.as_str(), v.as_str()))
@@ -841,14 +941,14 @@ fn walk_dir(dir: &Path, out: &mut Vec<String>) -> Result<()> {
 
 // --- decrypt all ----------------------------------------------------------
 
-fn decrypt_all(path: &Path) -> Result<Vec<(String, String)>> {
-    let file = store::SenvFile::load(path)?;
-    if file.keys.is_empty() {
+fn decrypt_all() -> Result<Vec<(String, String)>> {
+    let merged = merged_keys()?;
+    if merged.is_empty() {
         return Ok(Vec::new());
     }
     let pw = get_password()?;
-    let mut out = Vec::with_capacity(file.keys.len());
-    for (k, entry) in &file.keys {
+    let mut out = Vec::with_capacity(merged.len());
+    for (k, entry) in &merged {
         let v = store::decrypt_value(entry.value(), &pw)
             .with_context(|| format!("decrypting {k}"))?;
         out.push((k.clone(), v));
