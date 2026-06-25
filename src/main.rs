@@ -117,7 +117,10 @@ setup:
 password (one of):
   S_KEY env var                 the password directly
   S_KEY=\"!cmd\"                  execute cmd to get password
-  TTY prompt                    fallback if interactive"
+  TTY prompt                    fallback if interactive
+
+store location:
+  S_FILE env var                path to the .senv store (default: ./.senv)"
     );
 }
 
@@ -165,6 +168,13 @@ fn looks_like_key(s: &str) -> bool {
 }
 
 fn store_path() -> PathBuf {
+    // S_FILE overrides the store location so `s` works from any cwd
+    // (e.g. services that don't run from the directory holding .senv).
+    if let Ok(p) = std::env::var("S_FILE") {
+        if !p.is_empty() {
+            return PathBuf::from(p);
+        }
+    }
     PathBuf::from(STORE_FILE)
 }
 
