@@ -273,4 +273,13 @@ mod tests {
 
         assert_eq!(decrypt_value(&blob, password).unwrap(), plaintext);
     }
+
+    /// The single-password guard relies on this: a blob only decrypts under the
+    /// password it was written with, so a mismatched S_KEY is detectable.
+    #[test]
+    fn blob_only_decrypts_under_its_own_password() {
+        let blob = encrypt_value("v", "passA").unwrap();
+        assert!(decrypt_value(&blob, "passA").is_ok());
+        assert!(decrypt_value(&blob, "passB").is_err());
+    }
 }

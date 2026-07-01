@@ -289,6 +289,32 @@ fn merged_keys() -> Result<std::collections::BTreeMap<String, store::KeyEntry>> 
     Ok(merged)
 }
 
+/// A store must be encrypted under a single password. Writing a secret under a
+/// different password produces a store that `s --all` can't fully decrypt — it
+/// aborts on the mismatched entry, which can crash-loop anything driven by it.
+///
+/// Before writing, confirm `pw` decrypts at least one *existing* secret (i.e. it
+/// is the store's password). `exclude` is the key being written, so re-setting
+/// the sole secret in a single-key store — effectively re-keying it — is still
+/// allowed. An empty store has no password to match yet, so this passes.
+fn ensure_password_matches_store(pw: &str, exclude: &str) -> Result<()> {
+    let existing = merged_keys()?;
+    let mut others = existing.iter().filter(|(k, _)| k.as_str() != exclude).peekable();
+    if others.peek().is_none() {
+        return Ok(());
+    }
+    if others.any(|(_, e)| store::decrypt_value(e.value(), pw).is_ok()) {
+        return Ok(());
+    }
+    bail!(
+        "password does not match the existing store — refusing to write a secret \
+         under a different key.\n  \
+         Every secret in a store must share one password, or `s --all` will abort \
+         on the mismatched entry.\n  \
+         Use the store's original S_KEY, or remove the old secrets first (`s rm ...`)."
+    );
+}
+
 /// Get the password from S_KEY env (supports !command), or prompt on TTY.
 /// Wrapped in `Zeroizing` so the password is wiped from memory on drop.
 fn get_password() -> Result<Zeroizing<String>> {
@@ -526,6 +552,7 @@ fn set_key_value(key: &str, value: &str, force: bool) -> Result<()> {
         bail!("aborted");
     }
     let pw = get_password()?;
+    ensure_password_matches_store(&pw, key)?;
     let blob = store::encrypt_value(value, &pw)?;
     let verb = if file.keys.contains_key(key) { "updated" } else { "added" };
     file.set_key(key, blob);
@@ -673,6 +700,9 @@ fn cmd_import(args: &[String]) -> Result<()> {
     }
 
     let pw = get_password()?;
+    // Same single-password invariant as `set`: don't import secrets under a
+    // password that differs from the existing store. ("" excludes no real key.)
+    ensure_password_matches_store(&pw, "")?;
 
     if from_env {
         if let Some(name) = from_env_name {
