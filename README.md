@@ -150,12 +150,36 @@ The encryption password is resolved in order:
 
 ## Install
 
+Every [release](https://github.com/tobi/s/releases) ships prebuilt binaries —
+statically linked musl for Linux (x86_64, aarch64), and macOS (x86_64, arm64).
+No toolchain, no compile step.
+
 ```bash
-# Nix flake
+# mise — recommended for dotfiles
+mise use -g github:tobi/s
+
+# cargo-binstall — fetches the same prebuilt binary, no build
+cargo binstall --git https://github.com/tobi/s s
+
+# nix flake
 nix profile install github:tobi/s
 
-# Or build from source
+# from source
 cargo install --path .
+```
+
+To pin it in your dotfiles, put this in `~/.config/mise/config.toml`:
+
+```toml
+[tools]
+"github:tobi/s" = "latest"   # or "0.8.0" to pin
+```
+
+Or grab a tarball directly:
+
+```bash
+gh release download -R tobi/s -p '*-x86_64-unknown-linux-musl.tar.gz' -O - \
+  | tar xz -C ~/.local/bin
 ```
 
 ## Nix home-manager

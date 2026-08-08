@@ -2,6 +2,9 @@
 name = "s"
 version = "0.8.0"
 edition = "2021"
+description = "Encrypted env store — agents use secrets without seeing them"
+license = "MIT"
+repository = "https://github.com/tobi/s"
 
 [[bin]]
 name = "s"
@@ -25,3 +28,8 @@ libc = "0.2"
 lto = true
 opt-level = "z"
 strip = true
+
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/s-v{ version }-{ target }.tar.gz"
+pkg-fmt = "tgz"
+bin-dir = "s{ binary-ext }"
