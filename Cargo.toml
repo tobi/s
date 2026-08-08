@@ -5,6 +5,9 @@ edition = "2021"
 description = "Encrypted env store — agents use secrets without seeing them"
 license = "MIT"
 repository = "https://github.com/tobi/s"
+homepage = "https://github.com/tobi/s"
+readme = "README.md"
+exclude = [".senv"]
 
 [[bin]]
 name = "s"
@@ -22,6 +25,10 @@ sha2 = "0.10"
 getrandom = "0.2"
 argon2 = "0.5"
 zeroize = "1"
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
 libc = "0.2"
 
 [profile.release]

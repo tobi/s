@@ -13,10 +13,16 @@ s API_KEY -- curl -H "Authorization: Bearer $API_KEY" https://api.example.com
 ## Setup
 
 ```bash
-s init                          # creates .senv, installs pre-commit hook
+s init                          # creates .senv, ignores it, installs pre-commit hook
+s init --git                    # opt in to tracking the encrypted .senv
 s set API_KEY                   # interactive (masked input: ****)
 s set DB_URL --stdin            # piped
 ```
+
+`.senv` contains encrypted blobs and may be committed as long as its encryption
+key is kept private. `s init` ignores it by default; remove the generated
+`.gitignore` entry or initialize with `s init --git` when you intentionally want
+the encrypted store in Git. Never commit or share the encryption key.
 
 ## Managing secrets
 
@@ -136,15 +142,17 @@ The encryption password is resolved in order:
 
 - `s get` and `s export` **refuse without a TTY** — prevents secrets leaking into agent context
 - `s list` only shows names with `[REDACTED]`
-- `s KEY -- cmd` / `s --all -- cmd` inject secrets but scrub all output
+- `s KEY -- cmd` / `s --all -- cmd` inject secrets but scrub stdout, stderr, and PTY output
+- Dangerous loader/interpreter names such as `LD_PRELOAD`, `DYLD_*`, `PATH`, and `S_KEY` are rejected on import/set and never injected
 - Pre-commit hook blocks committing leaked secret values
 
 ## How it works
 
 - Each secret is independently encrypted with ChaCha20-Poly1305
-- Key derived with **Argon2id** (memory-hard) from your password + random per-value salt
-- `.senv` is safe to commit (only encrypted blobs); written with `0600` perms
-- Pre-0.7 stores (HKDF-derived) still decrypt; re-encrypting a value upgrades it
+- Keys are derived with **Argon2id** (memory-hard) from the password and a random per-value salt
+- `.senv` contains only encrypted blobs and is written with `0600` permissions
+- New stores are added to `.gitignore` by default; `s init --git` opts in to tracking
+- Older stores remain decryptable; writes upgrade legacy blobs to the current authenticated format
 - The master password (`S_KEY`) is stripped from injected subprocess environments
 - No daemon, no network, no SSH keys, no keychain dependency
 
