@@ -2,12 +2,15 @@
 //
 // .senv:
 //   keys:
-//     API_KEY: "<salt:nonce:ct in base64>"
-//     STRIPE_KEY:
-//       value: "<salt:nonce:ct>"
+//     API_KEY:
+//       value: "s2:<base64>"
 //       history:
-//         - blob: "<previous>"
-//           ts: "2026-04-11T14:30Z"
+//         - blob: "s2:<base64>"
+//           ts: "2026-04-11T14:30:00Z"
+//   domains:
+//     api.example.com:
+//       headers:
+//         Authorization: "Bearer $API_KEY"
 
 mod scrub;
 mod store;
@@ -21,6 +24,79 @@ use zeroize::Zeroizing;
 
 const STORE_FILE: &str = ".senv";
 const REDACTED: &str = "[REDACTED]";
+
+const AGENT_SKILL: &str = r#"---
+name: s
+description: Use when you need to use credentials and the project uses an .senv.
+---
+
+# Use credentials with `s`
+
+## Execute with credentials
+
+Name only the credentials the command needs:
+
+```sh
+s API_KEY -- command arg
+s API_KEY DB_URL -- command arg
+```
+
+Use `s --all -- command arg` only when the command needs every stored credential.
+`s` injects the selected names into the child environment and redacts their
+literal values from terminal output.
+
+## Credential-aware scripts
+
+Put the required credential names in the shebang:
+
+```python
+#!/usr/bin/env -S s API_KEY -- python3
+import os
+token = os.environ["API_KEY"]
+```
+
+For a fixed `s` installation path:
+
+```sh
+#!/usr/local/bin/s API_KEY DB_URL -- bash
+curl -H "Authorization: Bearer $API_KEY" "$DB_URL"
+```
+
+Make the script executable, then run it directly. `s` injects the named
+credentials before starting the interpreter.
+
+## HTTP requests
+
+Attach headers to a domain before using it with `s curl`:
+
+```sh
+s configure api.example.com \
+  --header 'Authorization: Bearer $API_KEY'
+```
+
+Repeat `--header` to add more headers. A key can appear in different templates
+for different domains. Keep placeholders single-quoted.
+
+Then call the URL:
+
+```sh
+s curl https://api.example.com/v1/items
+```
+
+Configured headers are added only when every request URL matches their allowed
+domains. Known `$KEY` and `${KEY}` placeholders in curl arguments are also
+substituted:
+
+```sh
+s curl -H 'Authorization: Bearer $API_KEY' \
+  --data '{"token":"${OTHER_KEY}"}' \
+  https://api.example.com/v1/items
+```
+
+Single-quote placeholders so the shell does not expand them. Credentialed HTTP
+is restricted to `localhost`, `*.localhost`, and loopback IPs; use HTTPS
+elsewhere.
+"#;
 
 fn main() {
     if let Err(e) = run() {
@@ -37,8 +113,19 @@ fn run() -> Result<()> {
         return Ok(());
     }
 
+    if args.as_slice() == ["--skill"] {
+        print!("{AGENT_SKILL}");
+        return Ok(());
+    }
+
     // Verify git hook exists (if in a git repo with .senv)
     check_hook();
+
+    // `curl` owns the rest of argv, including its own `--` option terminator.
+    // It must therefore dispatch before the generic `KEY -- command` form.
+    if args[0] == "curl" {
+        return cmd_curl(&args[1..]);
+    }
 
     // A `--` anywhere means exec form. Dispatch on it FIRST so a stored key
     // named `help` or `init` can never shadow a subcommand.
@@ -71,6 +158,7 @@ fn run() -> Result<()> {
     match args[0].as_str() {
         "init" => cmd_init(&args[1..]),
         "set" => cmd_set(&args[1..]),
+        "configure" | "config" => cmd_configure(&args[1..]),
         "get" => cmd_get(&args[1..]),
         "rm" => cmd_rm(&args[1..]),
         "list" | "ls" => cmd_list(&args[1..]),
@@ -92,21 +180,39 @@ fn print_usage() {
         "\
 s — encrypted env store. your agent doesn't need to know your secrets.
 
-usage:
-  s KEY [KEY...] -- <cmd>       run cmd with specific secrets injected
-  s --all -- <cmd>              run cmd with ALL secrets injected
+Agents:
+  s KEY [KEY...] -- <cmd>       run a command with only the named credentials
+  s configure HOST --header 'Name: $KEY'
+                                attach headers using a stored key to a domain
+  s curl [options] <URL>        use domain-scoped credentials for HTTP
+  #!/usr/bin/env -S s KEY -- python3
+                                inject credentials into an executable script
+  More agent information: s --skill
 
-inline / shebang mode:
-  #!/usr/bin/env -S s KEY [KEY...] -- python3
-  #!/usr/local/bin/s KEY [KEY...] -- python3
-                                inject secrets into scripts automatically
+Humans:
+  s set <NAME>                  set a secret interactively
+  s get <NAME>                  reveal a secret for human debugging
+  s configure <DOMAIN> --header 'Name: $NAME'
+                                attach domain-specific headers using stored keys
+  s list                        list names with values redacted
+
+Commands:
 
 secrets:
   s set <NAME>                  set a secret (interactive, masked)
   s set <NAME> --stdin          set from stdin
+  s configure <DOMAIN> \\
+    --header 'Authorization: Bearer $NAME'
+                                add or update headers for a domain
+  s configure <DOMAIN> --clear-headers
+                                remove the domain's configured headers
   s get <NAME>                  show decrypted value (human debugging)
   s rm <NAME>                   delete a secret
   s list                        list secrets (values masked)
+
+HTTP:
+  s curl [curl options] <URL>   run curl with domain-scoped configured headers
+                                and substitute known $KEY / ${{KEY}} placeholders
 
 import/export:
   s import .env                 import from .env file
@@ -147,15 +253,14 @@ password (one of):
 /// as well as the portable env form:
 ///   #!/usr/bin/env -S s API_KEY -- python3
 fn expand_inline_shebang_args(args: &mut Vec<String>) {
-    let Some(first) = args.first() else { return; };
+    let Some(first) = args.first() else {
+        return;
+    };
     if !first.contains("--") || !first.contains(char::is_whitespace) {
         return;
     }
 
-    let mut expanded: Vec<String> = first
-        .split_whitespace()
-        .map(|s| s.to_string())
-        .collect();
+    let mut expanded: Vec<String> = first.split_whitespace().map(|s| s.to_string()).collect();
     expanded.extend(args.iter().skip(1).cloned());
     *args = expanded;
 }
@@ -173,7 +278,6 @@ fn require_tty(action: &str) -> Result<()> {
     }
     Ok(())
 }
-
 
 /// Project-local store in the current directory.
 fn store_path() -> PathBuf {
@@ -268,26 +372,36 @@ fn store_containing(key: &str) -> Result<Option<PathBuf>> {
     Ok(None)
 }
 
-/// Merge every readable store into one map, local (higher precedence) winning.
-/// This is the single source of truth for all read paths, so one password
-/// decrypts everything.
-fn merged_keys() -> Result<std::collections::BTreeMap<String, store::KeyEntry>> {
-    use std::collections::BTreeMap;
-    if let Some(p) = override_store_path() {
-        if !p.exists() {
-            bail!("S_FILE={} does not exist — run `s init` first", p.display());
+/// Merge every readable store, local (higher precedence) winning independently
+/// for each key and configured header.
+fn merged_store() -> Result<store::SenvFile> {
+    if let Some(path) = override_store_path() {
+        if !path.exists() {
+            bail!(
+                "S_FILE={} does not exist — run `s init` first",
+                path.display()
+            );
         }
     }
-    let paths = read_store_paths();
-    let mut merged: BTreeMap<String, store::KeyEntry> = BTreeMap::new();
-    // Apply lowest precedence first so higher-precedence stores overwrite.
-    for p in paths.iter().rev() {
-        let f = store::SenvFile::load(p)?;
-        for (k, v) in f.keys {
-            merged.insert(k, v);
+    let mut merged = store::SenvFile::default();
+    // Apply lowest precedence first so higher-precedence values overwrite.
+    for path in read_store_paths().iter().rev() {
+        let file = store::SenvFile::load(path)?;
+        merged.keys.extend(file.keys);
+        for (domain, policy) in file.domains {
+            merged
+                .domains
+                .entry(domain)
+                .or_default()
+                .headers
+                .extend(policy.headers);
         }
     }
     Ok(merged)
+}
+
+fn merged_keys() -> Result<std::collections::BTreeMap<String, store::KeyEntry>> {
+    Ok(merged_store()?.keys)
 }
 
 /// Canonicalized paths of every store, so `scan` can exclude them by identity
@@ -309,28 +423,35 @@ fn store_paths_canonical() -> Vec<PathBuf> {
 /// never asked for on the heap, which is the opposite of the point.
 fn decrypt_selected(only: Option<&[String]>) -> Result<Vec<(String, String)>> {
     let merged = merged_keys()?;
+    decrypt_from_keys(&merged, only)
+}
+
+fn decrypt_from_keys(
+    keys: &std::collections::BTreeMap<String, store::KeyEntry>,
+    only: Option<&[String]>,
+) -> Result<Vec<(String, String)>> {
     let wanted: Vec<(&String, &store::KeyEntry)> = match only {
         Some(names) => {
             let mut out = Vec::with_capacity(names.len());
             for name in names {
-                let (k, e) = merged
+                let (key, entry) = keys
                     .get_key_value(name.as_str())
                     .ok_or_else(|| anyhow!("secret {name} not found. add it: s set {name}"))?;
-                out.push((k, e));
+                out.push((key, entry));
             }
             out
         }
-        None => merged.iter().collect(),
+        None => keys.iter().collect(),
     };
     if wanted.is_empty() {
         return Ok(Vec::new());
     }
-    let pw = get_password()?;
+    let password = get_password()?;
     let mut out = Vec::with_capacity(wanted.len());
-    for (k, entry) in wanted {
-        let v = store::decrypt_value(entry.value(), &pw, k)
-            .with_context(|| format!("decrypting {k}"))?;
-        out.push((k.clone(), v));
+    for (key, entry) in wanted {
+        let value = store::decrypt_value(entry.value(), &password, key)
+            .with_context(|| format!("decrypting {key}"))?;
+        out.push((key.clone(), value));
     }
     Ok(out)
 }
@@ -380,7 +501,10 @@ fn is_unsafe_env_name(k: &str) -> bool {
 /// allowed. An empty store has no password to match yet, so this passes.
 fn ensure_password_matches_store(pw: &str, exclude: &str) -> Result<()> {
     let existing = merged_keys()?;
-    let mut others = existing.iter().filter(|(k, _)| k.as_str() != exclude).peekable();
+    let mut others = existing
+        .iter()
+        .filter(|(k, _)| k.as_str() != exclude)
+        .peekable();
     if others.peek().is_none() {
         return Ok(());
     }
@@ -412,8 +536,7 @@ fn get_password() -> Result<Zeroizing<String>> {
             return Ok(Zeroizing::new(resolve_cli_value(&val)?));
         }
     }
-    let pw = rpassword::prompt_password("s password: ")
-        .context("reading password from TTY")?;
+    let pw = rpassword::prompt_password("s password: ").context("reading password from TTY")?;
     Ok(Zeroizing::new(pw))
 }
 
@@ -422,18 +545,25 @@ fn get_password() -> Result<Zeroizing<String>> {
 /// password, so leaking either would leak the secret.
 fn run_password_command(cmd: &str) -> Result<String> {
     let cmd = cmd.trim();
-    if cmd.is_empty() { bail!("empty S_KEY command") }
+    if cmd.is_empty() {
+        bail!("empty S_KEY command")
+    }
     let output = Command::new("sh")
         .args(["-c", cmd])
         .stdin(Stdio::null())
         .output()
         .context("running S_KEY command")?;
     if !output.status.success() {
-        bail!("S_KEY command failed (exit {})", output.status.code().unwrap_or(-1));
+        bail!(
+            "S_KEY command failed (exit {})",
+            output.status.code().unwrap_or(-1)
+        );
     }
     let s = String::from_utf8(output.stdout).context("S_KEY command output not UTF-8")?;
     let s = s.trim().to_string();
-    if s.is_empty() { bail!("S_KEY command produced no output") }
+    if s.is_empty() {
+        bail!("S_KEY command produced no output")
+    }
     Ok(s)
 }
 
@@ -503,7 +633,9 @@ fn resolve_hooks_dir() -> Option<PathBuf> {
     }
     let dir = String::from_utf8_lossy(&out.stdout);
     let dir = dir.trim();
-    if dir.is_empty() { return None; }
+    if dir.is_empty() {
+        return None;
+    }
     Some(PathBuf::from(dir))
 }
 
@@ -540,7 +672,9 @@ fn ensure_executable(path: &Path) -> Result<()> {
     Ok(())
 }
 #[cfg(not(unix))]
-fn ensure_executable(_path: &Path) -> Result<()> { Ok(()) }
+fn ensure_executable(_path: &Path) -> Result<()> {
+    Ok(())
+}
 
 fn install_hook() -> Result<()> {
     let hooks_dir = match resolve_hooks_dir() {
@@ -600,7 +734,8 @@ fn ensure_gitignore() -> Result<()> {
             .append(true)
             .open(&gi)
             .context("appending to .gitignore")?;
-        f.write_all(block.as_bytes()).context("writing .gitignore")?;
+        f.write_all(block.as_bytes())
+            .context("writing .gitignore")?;
     }
     eprintln!("s: ignored .senv by default");
     eprintln!(
@@ -635,13 +770,17 @@ fn allow_git_tracking() -> Result<()> {
 /// Warn if .senv exists but the pre-commit hook lacks a live `s scan` guard or
 /// is not executable. A commented-out `# s scan` does not count as a guard.
 fn check_hook() {
-    if !store_path().exists() { return }
+    if !store_path().exists() {
+        return;
+    }
     let hooks_dir = match resolve_hooks_dir() {
         Some(d) => d,
         None => return,
     };
     let hook = hooks_dir.join("pre-commit");
-    if !hook.exists() { return }
+    if !hook.exists() {
+        return;
+    }
     let content = std::fs::read_to_string(&hook).unwrap_or_default();
     if !has_scan_guard(&content) {
         eprintln!("s: ⚠ pre-commit hook exists but has no `s scan` guard. run `s init` to fix.");
@@ -659,31 +798,38 @@ fn is_executable(path: &Path) -> bool {
         .unwrap_or(false)
 }
 #[cfg(not(unix))]
-fn is_executable(_path: &Path) -> bool { true }
+fn is_executable(_path: &Path) -> bool {
+    true
+}
 
 // --- set / get / rm -------------------------------------------------------
 
 fn cmd_set(args: &[String]) -> Result<()> {
     let mut from_stdin = false;
     let mut force = false;
-    let mut positional: Vec<String> = Vec::new();
-    for a in args {
-        match a.as_str() {
+    let mut key: Option<&str> = None;
+    for arg in args {
+        match arg.as_str() {
             "--stdin" => from_stdin = true,
             "-f" | "--force" => force = true,
-            other => positional.push(other.to_string()),
+            arg if arg.starts_with('-') => bail!("unknown flag: {arg}"),
+            arg if key.is_none() => key = Some(arg),
+            arg => bail!("unexpected argument: {arg}"),
         }
     }
-    if positional.is_empty() {
-        bail!("usage: s set <NAME> [--stdin]");
+    let key = key.context("usage: s set <NAME> [--stdin]")?;
+    if !store::valid_key_name(key) {
+        bail!("invalid key: {key:?}")
     }
-    let key = &positional[0];
-    if !store::valid_key_name(key) { bail!("invalid key: {key:?}") }
-    if is_unsafe_env_name(key) { bail!("unsafe env name: {key} — cannot enter the store") }
+    if is_unsafe_env_name(key) {
+        bail!("unsafe env name: {key} — cannot enter the store")
+    }
 
     let value = if from_stdin {
         let mut buf = String::new();
-        io::stdin().read_to_string(&mut buf).context("reading stdin")?;
+        io::stdin()
+            .read_to_string(&mut buf)
+            .context("reading stdin")?;
         buf.trim_end_matches('\n').to_string()
     } else {
         read_secret_interactive(key)?
@@ -696,7 +842,9 @@ fn read_secret_interactive(key: &str) -> Result<String> {
     use std::io::BufReader;
 
     let tty = std::fs::OpenOptions::new()
-        .read(true).write(true).open("/dev/tty")
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
         .context("no TTY available — use --stdin")?;
     let mut tty_w = tty.try_clone()?;
     write!(tty_w, "{key}: ")?;
@@ -730,10 +878,13 @@ fn read_secret_interactive(key: &str) -> Result<String> {
         let mut reader = BufReader::new(&tty);
         let mut buf = [0u8; 1];
         loop {
-            if reader.read(&mut buf)? == 0 { break }
+            if reader.read(&mut buf)? == 0 {
+                break;
+            }
             match buf[0] {
                 b'\n' | b'\r' => break,
-                127 | 8 => { // backspace / delete — drop a whole UTF-8 char
+                127 | 8 => {
+                    // backspace / delete — drop a whole UTF-8 char
                     if !bytes.is_empty() {
                         let mut start = bytes.len() - 1;
                         while start > 0 && (bytes[start] & 0xC0) == 0x80 {
@@ -742,7 +893,9 @@ fn read_secret_interactive(key: &str) -> Result<String> {
                         bytes.truncate(start);
                         let _ = write!(tty_w, "\x08 \x08");
                         let _ = tty_w.flush();
-                        if stars > 0 { stars -= 1; }
+                        if stars > 0 {
+                            stars -= 1;
+                        }
                     }
                 }
                 3 => bail!("aborted"), // Ctrl-C
@@ -773,8 +926,7 @@ fn read_secret_interactive(key: &str) -> Result<String> {
     if bytes.is_empty() {
         bail!("empty value");
     }
-    String::from_utf8(bytes)
-        .map_err(|_| anyhow!("input is not valid UTF-8"))
+    String::from_utf8(bytes).map_err(|_| anyhow!("input is not valid UTF-8"))
 }
 
 fn set_key_value(key: &str, value: &str, force: bool) -> Result<()> {
@@ -789,22 +941,83 @@ fn set_key_value(key: &str, value: &str, force: bool) -> Result<()> {
         bail!("aborted");
     }
     let pw = get_password()?;
+
     ensure_password_matches_store(&pw, key)?;
     let blob = store::encrypt_value(value, &pw, key)?;
-    let verb = if file.keys.contains_key(key) { "updated" } else { "added" };
+    let verb = if file.keys.contains_key(key) {
+        "updated"
+    } else {
+        "added"
+    };
     file.set_key(key, blob, &pw)?;
+
     file.save(&path)?;
     eprintln!("s: {verb} {key}");
+    Ok(())
+}
+fn cmd_configure(args: &[String]) -> Result<()> {
+    let raw_domain = args.first().filter(|arg| !arg.starts_with('-')).context(
+        "usage: s configure <DOMAIN> --header 'NAME: VALUE' \
+             [--header 'NAME: VALUE' ...] [--clear-headers]",
+    )?;
+    let domain = normalize_domain_pattern(raw_domain)?;
+    let mut headers = std::collections::BTreeMap::new();
+    let mut clear = false;
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--header" => {
+                i += 1;
+                let raw = args.get(i).context("--header requires 'NAME: VALUE'")?;
+                let (name, template) = raw
+                    .split_once(':')
+                    .context("--header requires 'NAME: VALUE'")?;
+                let name = name.trim();
+                if !valid_header_name(name) {
+                    bail!("invalid HTTP header name: {name:?}");
+                }
+                let template = template.trim_start();
+                if template.contains(['\r', '\n', '\0']) {
+                    bail!("header template contains a forbidden control character");
+                }
+                headers.insert(name.to_string(), template.to_string());
+            }
+            "--clear-headers" => clear = true,
+            flag => bail!("unknown flag: {flag}"),
+        }
+        i += 1;
+    }
+    if headers.is_empty() && !clear {
+        bail!("configure requires --header or --clear-headers");
+    }
+
+    let path = ensure_store()?;
+    let mut file = store::SenvFile::load(&path)?;
+    if clear {
+        file.domains.remove(&domain);
+    }
+    if !headers.is_empty() {
+        file.domains
+            .entry(domain.clone())
+            .or_default()
+            .headers
+            .extend(headers);
+    }
+    file.save(&path)?;
+    eprintln!("s: configured {domain}");
     Ok(())
 }
 
 fn cmd_get(args: &[String]) -> Result<()> {
     require_tty("show secret")?;
-    if args.is_empty() { bail!("usage: s get <NAME>") }
+    if args.is_empty() {
+        bail!("usage: s get <NAME>")
+    }
     ensure_store()?;
     let key = &args[0];
     let merged = merged_keys()?;
-    let entry = merged.get(key.as_str())
+    let entry = merged
+        .get(key.as_str())
         .ok_or_else(|| anyhow!("key {key} not found"))?;
     let pw = get_password()?;
     let v = store::decrypt_value(entry.value(), &pw, key)
@@ -817,10 +1030,11 @@ fn cmd_get(args: &[String]) -> Result<()> {
 /// `rm .senv`, which the same actor can already do, and requiring a password
 /// would strand anyone who lost it.
 fn cmd_rm(args: &[String]) -> Result<()> {
-    if args.is_empty() { bail!("usage: s rm <NAME>") }
+    if args.is_empty() {
+        bail!("usage: s rm <NAME>")
+    }
     let key = &args[0];
-    let path = store_containing(key)?
-        .ok_or_else(|| anyhow!("key {key} not found"))?;
+    let path = store_containing(key)?.ok_or_else(|| anyhow!("key {key} not found"))?;
     let mut file = store::SenvFile::load(&path)?;
     file.keys.remove(key);
     file.save(&path)?;
@@ -833,24 +1047,37 @@ fn cmd_rm(args: &[String]) -> Result<()> {
 fn cmd_list(args: &[String]) -> Result<()> {
     let mut json = false;
     for a in args {
-        if a == "--json" { json = true }
-        else { bail!("unknown flag: {a}") }
+        if a == "--json" {
+            json = true
+        } else {
+            bail!("unknown flag: {a}")
+        }
     }
     // Only a genuinely absent store is empty; a load/parse error is real.
     let paths = read_store_paths();
     if paths.is_empty() {
-        if json { println!("[]") } else { eprintln!("s: no {STORE_FILE} here") }
+        if json {
+            println!("[]")
+        } else {
+            eprintln!("s: no {STORE_FILE} here")
+        }
         return Ok(());
     }
     let keys = merged_keys()?;
     if keys.is_empty() {
-        if json { println!("[]") } else { eprintln!("s: (no secrets)") }
+        if json {
+            println!("[]")
+        } else {
+            eprintln!("s: (no secrets)")
+        }
         return Ok(());
     }
     if json {
         print!("[");
         for (i, k) in keys.keys().enumerate() {
-            if i > 0 { print!(",") }
+            if i > 0 {
+                print!(",")
+            }
             print!("\"{k}\"");
         }
         println!("]");
@@ -860,6 +1087,780 @@ fn cmd_list(args: &[String]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+// --- curl -----------------------------------------------------------------
+
+fn valid_header_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(
+                    b,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
+}
+
+fn normalize_domain_pattern(raw: &str) -> Result<String> {
+    let raw = raw.trim().trim_end_matches('.').to_ascii_lowercase();
+    let wildcard = raw.starts_with("*.");
+    let host = raw.strip_prefix("*.").unwrap_or(&raw);
+    if host.is_empty()
+        || host.contains('*')
+        || host.contains('/')
+        || wildcard && host.parse::<std::net::IpAddr>().is_ok()
+        || host.contains(':') && host.parse::<std::net::Ipv6Addr>().is_err()
+        || !host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b':'))
+    {
+        bail!("invalid domain pattern: {raw:?}");
+    }
+    Ok(if wildcard {
+        format!("*.{host}")
+    } else {
+        host.to_string()
+    })
+}
+
+fn domain_matches(pattern: &str, host: &str) -> bool {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    if let Some(suffix) = pattern.strip_prefix("*.") {
+        host.len() > suffix.len()
+            && host.ends_with(suffix)
+            && host.as_bytes()[host.len() - suffix.len() - 1] == b'.'
+    } else {
+        host == pattern
+    }
+}
+
+fn policy_matches_urls(pattern: &str, urls: &[url::Url]) -> bool {
+    urls.iter().all(|url| {
+        url.host_str()
+            .is_some_and(|host| domain_matches(pattern, host))
+    })
+}
+
+fn policy_matches_any_url(pattern: &str, urls: &[url::Url]) -> bool {
+    urls.iter().any(|url| {
+        url.host_str()
+            .is_some_and(|host| domain_matches(pattern, host))
+    })
+}
+
+fn parse_curl_url(raw: &str) -> Result<url::Url> {
+    if raw.contains(['{', '}']) {
+        bail!("s curl does not allow URL globbing when selecting credential domains");
+    }
+    let candidate = if raw.contains("://") {
+        raw.to_string()
+    } else {
+        format!("http://{raw}")
+    };
+    let url = url::Url::parse(&candidate).with_context(|| format!("invalid curl URL: {raw}"))?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        bail!("s curl only supports HTTP(S) URLs, got {raw:?}");
+    }
+    let host_text = &url[url::Position::BeforeHost..url::Position::AfterHost];
+    let outside_host = candidate.replacen(host_text, "", 1);
+    if outside_host.contains(['[', ']']) {
+        bail!("s curl does not allow URL globbing when selecting credential domains");
+    }
+    Ok(url)
+}
+
+fn curl_short_option_name(short: u8) -> Option<&'static str> {
+    Some(match short {
+        b'A' => "user-agent",
+        b'b' => "cookie",
+        b'c' => "cookie-jar",
+        b'C' => "continue-at",
+        b'd' => "data",
+        b'D' => "dump-header",
+        b'e' => "referer",
+        b'E' => "cert",
+        b'F' => "form",
+        b'H' => "header",
+        b'K' => "config",
+        b'm' => "max-time",
+        b'o' => "output",
+        b'P' => "ftp-port",
+        b'Q' => "quote",
+        b'r' => "range",
+        b't' => "telnet-option",
+        b'T' => "upload-file",
+        b'u' => "user",
+        b'U' => "proxy-user",
+        b'w' => "write-out",
+        b'x' => "proxy",
+        b'X' => "request",
+        b'Y' => "speed-limit",
+        b'y' => "speed-time",
+        b'z' => "time-cond",
+        _ => return None,
+    })
+}
+
+fn curl_long_option_takes_value(option: &str) -> bool {
+    matches!(
+        option,
+        "abstract-unix-socket"
+            | "alt-svc"
+            | "aws-sigv4"
+            | "cacert"
+            | "capath"
+            | "cert"
+            | "cert-type"
+            | "ciphers"
+            | "config"
+            | "connect-timeout"
+            | "connect-to"
+            | "continue-at"
+            | "cookie"
+            | "cookie-jar"
+            | "create-file-mode"
+            | "crlfile"
+            | "curves"
+            | "data"
+            | "data-ascii"
+            | "data-binary"
+            | "data-raw"
+            | "data-urlencode"
+            | "delegation"
+            | "dns-interface"
+            | "dns-ipv4-addr"
+            | "dns-ipv6-addr"
+            | "dns-servers"
+            | "doh-url"
+            | "dump-header"
+            | "ech"
+            | "engine"
+            | "etag-compare"
+            | "etag-save"
+            | "expect100-timeout"
+            | "form"
+            | "form-string"
+            | "ftp-account"
+            | "ftp-alternative-to-user"
+            | "ftp-method"
+            | "ftp-port"
+            | "happy-eyeballs-timeout-ms"
+            | "haproxy-clientip"
+            | "header"
+            | "hostpubmd5"
+            | "hostpubsha256"
+            | "hsts"
+            | "interface"
+            | "ip-tos"
+            | "ipfs-gateway"
+            | "json"
+            | "keepalive-cnt"
+            | "keepalive-time"
+            | "key"
+            | "key-type"
+            | "knownhosts"
+            | "krb"
+            | "libcurl"
+            | "limit-rate"
+            | "local-port"
+            | "login-options"
+            | "mail-auth"
+            | "mail-from"
+            | "mail-rcpt"
+            | "max-filesize"
+            | "max-redirs"
+            | "max-time"
+            | "noproxy"
+            | "oauth2-bearer"
+            | "output"
+            | "output-dir"
+            | "parallel-max"
+            | "parallel-max-host"
+            | "pass"
+            | "pinnedpubkey"
+            | "preproxy"
+            | "proto"
+            | "proto-default"
+            | "proto-redir"
+            | "proxy"
+            | "proxy-cacert"
+            | "proxy-capath"
+            | "proxy-cert"
+            | "proxy-cert-type"
+            | "proxy-ciphers"
+            | "proxy-crlfile"
+            | "proxy-header"
+            | "proxy-key"
+            | "proxy-key-type"
+            | "proxy-pass"
+            | "proxy-pinnedpubkey"
+            | "proxy-service-name"
+            | "proxy-tls13-ciphers"
+            | "proxy-tlspassword"
+            | "proxy-tlsuser"
+            | "proxy-user"
+            | "proxy1.0"
+            | "pubkey"
+            | "quote"
+            | "range"
+            | "rate"
+            | "referer"
+            | "request"
+            | "request-target"
+            | "resolve"
+            | "retry"
+            | "retry-delay"
+            | "retry-max-time"
+            | "sasl-authzid"
+            | "service-name"
+            | "sigalgs"
+            | "socks4"
+            | "socks4a"
+            | "socks5"
+            | "socks5-gssapi-service"
+            | "socks5-hostname"
+            | "speed-limit"
+            | "speed-time"
+            | "stderr"
+            | "telnet-option"
+            | "tftp-blksize"
+            | "time-cond"
+            | "tls-max"
+            | "tls13-ciphers"
+            | "tlsauthtype"
+            | "tlspassword"
+            | "tlsuser"
+            | "trace"
+            | "trace-ascii"
+            | "trace-config"
+            | "unix-socket"
+            | "upload-file"
+            | "url"
+            | "url-query"
+            | "user"
+            | "user-agent"
+            | "variable"
+            | "vlan-priority"
+            | "write-out"
+    )
+}
+
+fn curl_option_value(arg: &str) -> Option<(&str, Option<&str>)> {
+    if let Some(long) = arg.strip_prefix("--") {
+        if let Some((name, value)) = long.split_once('=') {
+            return Some((name, Some(value)));
+        }
+        return curl_long_option_takes_value(long).then_some((long, None));
+    }
+    let short = arg.strip_prefix('-')?;
+    if !short.is_ascii() {
+        return None;
+    }
+    for (offset, byte) in short.bytes().enumerate() {
+        if let Some(name) = curl_short_option_name(byte) {
+            let value = (offset + 1 < short.len()).then(|| &short[offset + 1..]);
+            return Some((name, value));
+        }
+    }
+    None
+}
+
+fn curl_short_has_flag(arg: &str, wanted: u8) -> bool {
+    let Some(short) = arg.strip_prefix('-').filter(|s| !s.starts_with('-')) else {
+        return false;
+    };
+    for byte in short.bytes() {
+        if byte == wanted {
+            return true;
+        }
+        if curl_short_option_name(byte).is_some() {
+            return false;
+        }
+    }
+    false
+}
+
+fn curl_target_urls(args: &[String]) -> Result<Vec<url::Url>> {
+    let mut urls = Vec::new();
+    let mut options = true;
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        if options && arg == "--" {
+            options = false;
+            i += 1;
+            continue;
+        }
+        if options {
+            if matches!(arg.as_str(), "-K" | "--config") || arg.starts_with("--config=") {
+                bail!("s curl does not accept curl config files (they bypass domain checks)");
+            }
+            if let Some((name, attached)) = curl_option_value(arg) {
+                if name == "config" {
+                    bail!("s curl does not accept curl config files (they bypass domain checks)");
+                }
+                let value = match attached {
+                    Some(value) => value,
+                    None => {
+                        i += 1;
+                        args.get(i)
+                            .with_context(|| format!("curl option {arg} requires a value"))?
+                    }
+                };
+                if name == "url" {
+                    urls.push(parse_curl_url(value)?);
+                }
+                i += 1;
+                continue;
+            }
+            if arg.starts_with('-') {
+                i += 1;
+                continue;
+            }
+        }
+        urls.push(parse_curl_url(arg)?);
+        i += 1;
+    }
+    Ok(urls)
+}
+
+fn curl_manual_header_names(args: &[String]) -> std::collections::BTreeSet<String> {
+    let mut names = std::collections::BTreeSet::new();
+    let mut options = true;
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        if options && arg == "--" {
+            options = false;
+            i += 1;
+            continue;
+        }
+        if options {
+            if let Some((name, attached)) = curl_option_value(arg) {
+                let value = attached.or_else(|| args.get(i + 1).map(String::as_str));
+                if name == "header" {
+                    if let Some((header, _)) = value.and_then(|value| value.split_once(':')) {
+                        names.insert(header.trim().to_ascii_lowercase());
+                    }
+                }
+                if attached.is_none() {
+                    i += 1;
+                }
+            }
+        }
+        i += 1;
+    }
+    names
+}
+
+fn placeholder_names(
+    input: &str,
+    keys: &std::collections::BTreeMap<String, store::KeyEntry>,
+) -> std::collections::BTreeSet<String> {
+    let bytes = input.as_bytes();
+    let mut names = std::collections::BTreeSet::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'$' {
+            i += 1;
+            continue;
+        }
+        let (start, end, braced) = if bytes.get(i + 1) == Some(&b'{') {
+            let start = i + 2;
+            let Some(rel_end) = input[start..].find('}') else {
+                i += 1;
+                continue;
+            };
+            (start, start + rel_end, true)
+        } else {
+            let start = i + 1;
+            let mut end = start;
+            while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
+                end += 1;
+            }
+            (start, end, false)
+        };
+        if end > start {
+            let name = &input[start..end];
+            if keys.contains_key(name) {
+                names.insert(name.to_string());
+            }
+        }
+        i = end + usize::from(braced);
+    }
+    names
+}
+
+fn expand_placeholders(input: &str, values: &std::collections::BTreeMap<&str, &str>) -> String {
+    let bytes = input.as_bytes();
+    let mut out = String::with_capacity(input.len());
+    let mut copied = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'$' {
+            i += 1;
+            continue;
+        }
+        let (start, end, token_end) = if bytes.get(i + 1) == Some(&b'{') {
+            let start = i + 2;
+            let Some(rel_end) = input[start..].find('}') else {
+                i += 1;
+                continue;
+            };
+            let end = start + rel_end;
+            (start, end, end + 1)
+        } else {
+            let start = i + 1;
+            let mut end = start;
+            while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
+                end += 1;
+            }
+            (start, end, end)
+        };
+        if let Some(value) = values.get(&input[start..end]) {
+            out.push_str(&input[copied..i]);
+            out.push_str(value);
+            copied = token_end;
+        }
+        i = token_end.max(i + 1);
+    }
+    out.push_str(&input[copied..]);
+    out
+}
+
+fn curl_config_quote(value: &str) -> Result<String> {
+    if value.contains('\0') {
+        bail!("curl value contains NUL");
+    }
+    let mut quoted = String::with_capacity(value.len() + 2);
+    quoted.push('"');
+    for c in value.chars() {
+        match c {
+            '\\' => quoted.push_str("\\\\"),
+            '"' => quoted.push_str("\\\""),
+            '\n' => quoted.push_str("\\n"),
+            '\r' => quoted.push_str("\\r"),
+            '\t' => quoted.push_str("\\t"),
+            _ => quoted.push(c),
+        }
+    }
+    quoted.push('"');
+    Ok(quoted)
+}
+
+fn curl_config_line(config: &mut String, option: &str, value: &str) -> Result<()> {
+    if option.is_empty()
+        || !option
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        bail!("invalid curl option name: {option:?}");
+    }
+    config.push_str(option);
+    config.push_str(" = ");
+    config.push_str(&curl_config_quote(value)?);
+    config.push('\n');
+    Ok(())
+}
+
+fn prepare_curl_args(
+    args: &[String],
+    values: &std::collections::BTreeMap<&str, &str>,
+    config: &mut String,
+) -> Result<Vec<String>> {
+    let mut out = Vec::with_capacity(args.len() + 2);
+    let mut options = true;
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        if options && arg == "--" {
+            options = false;
+            out.push(arg.clone());
+            i += 1;
+            continue;
+        }
+        if options {
+            if let Some((name, attached)) = curl_option_value(arg) {
+                if let Some(value) = attached {
+                    let expanded = expand_placeholders(value, values);
+                    if expanded != value {
+                        curl_config_line(config, name, &expanded)?;
+                    } else {
+                        out.push(arg.clone());
+                    }
+                    i += 1;
+                    continue;
+                }
+                if let Some(value) = args.get(i + 1) {
+                    let expanded = expand_placeholders(value, values);
+                    if expanded != *value {
+                        curl_config_line(config, name, &expanded)?;
+                        i += 2;
+                        continue;
+                    }
+                }
+                out.push(arg.clone());
+                i += 1;
+                continue;
+            }
+        }
+        let expanded = expand_placeholders(arg, values);
+        if expanded != *arg {
+            curl_config_line(config, "url", &expanded)?;
+        } else {
+            out.push(arg.clone());
+        }
+        i += 1;
+    }
+    Ok(out)
+}
+
+fn curl_uses_redirects(args: &[String]) -> bool {
+    args.iter().any(|arg| {
+        matches!(
+            arg.as_str(),
+            "--location" | "--location-trusted" | "--follow"
+        ) || curl_short_has_flag(arg, b'L')
+    })
+}
+
+fn curl_uses_next(args: &[String]) -> bool {
+    args.iter()
+        .any(|arg| matches!(arg.as_str(), "--next" | "-:"))
+}
+
+fn curl_disables_tls_verification(args: &[String]) -> bool {
+    args.iter()
+        .any(|arg| arg == "--insecure" || curl_short_has_flag(arg, b'k'))
+}
+
+fn curl_bypasses_scrubber(args: &[String]) -> bool {
+    args.iter().any(|arg| {
+        if matches!(arg.as_str(), "--remote-name" | "--remote-name-all")
+            || curl_short_has_flag(arg, b'O')
+        {
+            return true;
+        }
+        curl_option_value(arg).is_some_and(|(name, _)| {
+            matches!(
+                name,
+                "output"
+                    | "output-dir"
+                    | "dump-header"
+                    | "stderr"
+                    | "trace"
+                    | "trace-ascii"
+                    | "trace-config"
+                    | "libcurl"
+            )
+        })
+    })
+}
+
+fn safe_secret_transport(url: &url::Url) -> bool {
+    if url.scheme() == "https" {
+        return true;
+    }
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host.len() > ".localhost".len()
+            && host[host.len() - ".localhost".len()..].eq_ignore_ascii_case(".localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+#[cfg(unix)]
+fn secure_curl_config(contents: &str) -> Result<(std::fs::File, String)> {
+    use std::io::{Seek, SeekFrom};
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut last_error = None;
+    for _ in 0..16 {
+        let mut random = [0u8; 12];
+        getrandom::getrandom(&mut random).map_err(|e| anyhow!("getrandom: {e}"))?;
+        let suffix: String = random.iter().map(|b| format!("{b:02x}")).collect();
+        let path = std::env::temp_dir().join(format!(".s-curl-{suffix}"));
+        let mut options = std::fs::OpenOptions::new();
+        options
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW);
+        let mut file = match options.open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                last_error = Some(error);
+                continue;
+            }
+            Err(error) => return Err(error).context("creating curl credential config"),
+        };
+        file.write_all(contents.as_bytes())
+            .context("writing curl credential config")?;
+        file.seek(SeekFrom::Start(0))?;
+        std::fs::remove_file(&path).context("unlinking curl credential config")?;
+
+        let fd = file.as_raw_fd();
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) } < 0 {
+            bail!(
+                "making curl credential descriptor inheritable: {}",
+                io::Error::last_os_error()
+            );
+        }
+        #[cfg(target_os = "linux")]
+        let fd_path = format!("/proc/self/fd/{fd}");
+        #[cfg(not(target_os = "linux"))]
+        let fd_path = format!("/dev/fd/{fd}");
+        return Ok((file, fd_path));
+    }
+    Err(last_error
+        .unwrap_or_else(|| io::Error::new(io::ErrorKind::AlreadyExists, "name collision"))
+        .into())
+}
+
+fn cmd_curl(args: &[String]) -> Result<()> {
+    let urls = curl_target_urls(args)?;
+    if urls.is_empty() {
+        let mut command = vec!["curl".to_string()];
+        command.extend_from_slice(args);
+        return run_scrubbed(&command, &[], &[]);
+    }
+
+    let merged = merged_store()?;
+    let keys = &merged.keys;
+    let manual_headers = curl_manual_header_names(args);
+    let mut configured = std::collections::BTreeMap::<String, (String, String, String)>::new();
+    let mut authorized = std::collections::BTreeSet::new();
+    for (domain, policy) in &merged.domains {
+        if policy.headers.is_empty() {
+            continue;
+        }
+        let any = policy_matches_any_url(domain, &urls);
+        let all = policy_matches_urls(domain, &urls);
+        if any && !all {
+            bail!(
+                "curl invocation mixes URLs matched and unmatched by {domain}; \
+                 split it into separate s curl commands"
+            );
+        }
+        if !all {
+            continue;
+        }
+        for (name, template) in &policy.headers {
+            if !valid_header_name(name) {
+                bail!("invalid configured HTTP header name for {domain}: {name:?}");
+            }
+            authorized.extend(placeholder_names(template, keys));
+            let normalized = name.to_ascii_lowercase();
+            if manual_headers.contains(&normalized) {
+                continue;
+            }
+            if let Some((previous_name, previous_template, previous_domain)) =
+                configured.get(&normalized)
+            {
+                if previous_template != template {
+                    bail!(
+                        "conflicting {previous_name} header configuration for \
+                         {previous_domain} and {domain}"
+                    );
+                }
+                continue;
+            }
+            configured.insert(normalized, (name.clone(), template.clone(), domain.clone()));
+        }
+    }
+
+    let mut referenced = std::collections::BTreeSet::new();
+    for arg in args {
+        referenced.extend(placeholder_names(arg, keys));
+    }
+    for (_, template, _) in configured.values() {
+        referenced.extend(placeholder_names(template, keys));
+    }
+    for name in &referenced {
+        if !authorized.contains(name) {
+            let hosts = urls
+                .iter()
+                .filter_map(url::Url::host_str)
+                .collect::<Vec<_>>()
+                .join(", ");
+            bail!(
+                "{name} is not authorized for every target host ({hosts}); \
+                 configure matching domain headers before using it with s curl"
+            );
+        }
+    }
+
+    let protected = !configured.is_empty() || !referenced.is_empty();
+    if protected && urls.iter().any(|url| !safe_secret_transport(url)) {
+        bail!(
+            "s curl sends credentials only over HTTPS \
+             (HTTP is allowed for loopback and *.localhost)"
+        );
+    }
+    if protected && curl_uses_redirects(args) {
+        bail!(
+            "s curl refuses redirects with credentials because curl can forward custom \
+             headers to another host; request the allowed destination directly"
+        );
+    }
+    if protected && curl_uses_next(args) {
+        bail!("s curl refuses --next with credentials; split it into separate commands");
+    }
+    if protected && curl_disables_tls_verification(args) {
+        bail!("s curl refuses --insecure with credentials");
+    }
+    if protected && curl_bypasses_scrubber(args) {
+        bail!("s curl refuses output/trace files with credentials because they bypass redaction");
+    }
+
+    let names: Vec<String> = referenced.into_iter().collect();
+    let entries = decrypt_from_keys(keys, Some(&names))?;
+    let values: std::collections::BTreeMap<&str, &str> = entries
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.as_str()))
+        .collect();
+
+    let mut config = String::new();
+    for (_, (name, template, _)) in configured {
+        let value = expand_placeholders(&template, &values);
+        if value.contains(['\r', '\n', '\0']) {
+            bail!("configured {name} header expands to a forbidden control character");
+        }
+        curl_config_line(&mut config, "header", &format!("{name}: {value}"))?;
+    }
+    let forwarded = prepare_curl_args(args, &values, &mut config)?;
+    let mut command = vec!["curl".to_string()];
+    let _config_guard = if config.is_empty() {
+        command.extend(forwarded);
+        None
+    } else {
+        let (guard, path) = secure_curl_config(&config)?;
+        command.push("--config".to_string());
+        command.push(path);
+        command.extend(forwarded);
+        Some(guard)
+    };
+    run_scrubbed(&command, &entries, &[])
 }
 
 // --- exec -----------------------------------------------------------------
@@ -878,22 +1879,30 @@ fn cmd_exec(cmd_args: &[String], only: Option<&[String]>) -> Result<()> {
         }
     }
     let entries = decrypt_selected(only)?;
+    run_scrubbed(cmd_args, &entries, &entries)
+}
 
-    // One scrubber for both paths: longest-match-first, empty values dropped
-    // so a blank secret can't blank every line of output.
-    let secrets: Vec<Vec<u8>> = entries
+/// Run a child while redacting `scrub_entries` from every output path.
+/// `env_entries` is separate because `s curl` must scrub the secrets it uses
+/// without also exposing them as environment variables to curl or its helpers.
+fn run_scrubbed(
+    cmd_args: &[String],
+    scrub_entries: &[(String, String)],
+    env_entries: &[(String, String)],
+) -> Result<()> {
+    let secrets: Vec<Vec<u8>> = scrub_entries
         .iter()
-        .map(|(_, v)| v.as_bytes().to_vec())
-        .filter(|v| !v.is_empty())
+        .map(|(_, value)| value.as_bytes().to_vec())
+        .filter(|value| !value.is_empty())
         .collect();
     let scrubber = std::sync::Arc::new(scrub::Scrubber::new(&secrets));
 
     // A human at a terminal gets a PTY so /dev/tty and fd 0 flow through the
     // scrubber; pipes (agent/CI) keep two streams with locked writes.
     if is_tty() {
-        pty::exec_pty(cmd_args, &entries, scrubber)
+        pty::exec_pty(cmd_args, env_entries, scrubber)
     } else {
-        exec_pipes(cmd_args, &entries, scrubber)
+        exec_pipes(cmd_args, env_entries, scrubber)
     }
 }
 
@@ -953,7 +1962,9 @@ fn exec_pipes(
     cmd.stderr(Stdio::piped());
     cmd.stdin(Stdio::inherit());
 
-    let mut child = cmd.spawn().with_context(|| format!("spawn {}", &cmd_args[0]))?;
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("spawn {}", &cmd_args[0]))?;
     CHILD_PID.store(child.id() as i32, std::sync::atomic::Ordering::SeqCst);
     install_signal_forwarders();
 
@@ -1005,7 +2016,9 @@ mod pty {
 
     extern "C" fn on_winch(_sig: libc::c_int) {
         let m = MASTER.load(Ordering::Relaxed);
-        if m < 0 { return; }
+        if m < 0 {
+            return;
+        }
         unsafe {
             let mut ws: libc::winsize = std::mem::zeroed();
             if libc::ioctl(0, libc::TIOCGWINSZ, &mut ws as *mut _) == 0 {
@@ -1025,46 +2038,67 @@ mod pty {
 
     /// Restore the parent terminal on drop — every path, including `?` unwinds,
     /// so raw mode never leaks to the shell.
-    struct TermRaw { fd: Option<libc::c_int>, saved: libc::termios }
+    struct TermRaw {
+        fd: Option<libc::c_int>,
+        saved: libc::termios,
+    }
     impl TermRaw {
         fn new() -> Result<Self> {
             // Raw-mode the terminal the user types on: stdin if it's a tty,
             // else the first of stdout/stderr that is. If none is a tty there's
             // nothing to raw-mode — the PTY relay still scrubs output, and the
             // stdin relay reads EOF right away.
-            let fd = [0, 1, 2].into_iter().find(|&fd| unsafe { libc::isatty(fd) } == 1);
+            let fd = [0, 1, 2]
+                .into_iter()
+                .find(|&fd| unsafe { libc::isatty(fd) } == 1);
             let Some(fd) = fd else {
-                return Ok(TermRaw { fd: None, saved: unsafe { std::mem::zeroed() } });
+                return Ok(TermRaw {
+                    fd: None,
+                    saved: unsafe { std::mem::zeroed() },
+                });
             };
             let mut saved: libc::termios = unsafe { std::mem::zeroed() };
             if unsafe { libc::tcgetattr(fd, &mut saved) } != 0 {
                 bail!("tcgetattr: {}", io::Error::last_os_error());
             }
             let mut raw = saved;
-            unsafe { libc::cfmakeraw(&mut raw); }
+            unsafe {
+                libc::cfmakeraw(&mut raw);
+            }
             if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw) } != 0 {
                 bail!("tcsetattr: {}", io::Error::last_os_error());
             }
-            Ok(TermRaw { fd: Some(fd), saved })
+            Ok(TermRaw {
+                fd: Some(fd),
+                saved,
+            })
         }
     }
     impl Drop for TermRaw {
         fn drop(&mut self) {
             if let Some(fd) = self.fd {
-                unsafe { libc::tcsetattr(fd, libc::TCSANOW, &self.saved); }
+                unsafe {
+                    libc::tcsetattr(fd, libc::TCSANOW, &self.saved);
+                }
             }
         }
     }
 
     /// Reading the master returns EIO on Linux once the child exits; treat that
     /// as clean EOF (the Scrubber only retries EINTR).
-    struct MasterRead { fd: libc::c_int }
+    struct MasterRead {
+        fd: libc::c_int,
+    }
     impl Read for MasterRead {
         fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
             let n = unsafe { libc::read(self.fd, buf.as_mut_ptr() as *mut _, buf.len()) };
-            if n >= 0 { return Ok(n as usize); }
+            if n >= 0 {
+                return Ok(n as usize);
+            }
             let e = io::Error::last_os_error();
-            if e.raw_os_error() == Some(libc::EIO) { return Ok(0); }
+            if e.raw_os_error() == Some(libc::EIO) {
+                return Ok(0);
+            }
             Err(e)
         }
     }
@@ -1076,7 +2110,9 @@ mod pty {
     ) -> Result<()> {
         // Open the master (O_NOCTTY: the parent keeps its own controlling tty).
         let master = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY) };
-        if master < 0 { bail!("posix_openpt: {}", io::Error::last_os_error()); }
+        if master < 0 {
+            bail!("posix_openpt: {}", io::Error::last_os_error());
+        }
         if unsafe { libc::grantpt(master) } < 0 {
             bail!("grantpt: {}", io::Error::last_os_error());
         }
@@ -1085,15 +2121,21 @@ mod pty {
         }
         let slave_name: CString = unsafe {
             let p = libc::ptsname(master);
-            if p.is_null() { bail!("ptsname: {}", io::Error::last_os_error()); }
+            if p.is_null() {
+                bail!("ptsname: {}", io::Error::last_os_error());
+            }
             CStr::from_ptr(p).to_owned()
         };
         let slave = unsafe { libc::open(slave_name.as_ptr(), libc::O_RDWR | libc::O_NOCTTY) };
-        if slave < 0 { bail!("open pty slave: {}", io::Error::last_os_error()); }
+        if slave < 0 {
+            bail!("open pty slave: {}", io::Error::last_os_error());
+        }
 
         copy_winsz(master);
         MASTER.store(master, Ordering::SeqCst);
-        unsafe { libc::signal(libc::SIGWINCH, on_winch as *const () as libc::sighandler_t); }
+        unsafe {
+            libc::signal(libc::SIGWINCH, on_winch as *const () as libc::sighandler_t);
+        }
 
         let raw = TermRaw::new()?;
 
@@ -1109,22 +2151,32 @@ mod pty {
                 // SAFETY: running between fork and exec; we own fds 0/1/2 and
                 // the session. All calls are async-signal-safe here.
                 {
-                    if libc::setsid() < 0 { return Err(io::Error::last_os_error()); }
+                    if libc::setsid() < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
                     for fd in 0..=2 {
-                        if libc::dup2(sfd, fd) < 0 { return Err(io::Error::last_os_error()); }
+                        if libc::dup2(sfd, fd) < 0 {
+                            return Err(io::Error::last_os_error());
+                        }
                     }
                     // fd 0 is now the slave — acquire it as controlling terminal.
                     libc::ioctl(0, libc::TIOCSCTTY, 0 as libc::c_int);
-                    if sfd > 2 { libc::close(sfd); }
+                    if sfd > 2 {
+                        libc::close(sfd);
+                    }
                     libc::close(mfd); // child must not hold the master open
                     Ok(())
                 }
             });
         }
 
-        let mut child = cmd.spawn().with_context(|| format!("spawn {}", &cmd_args[0]))?;
+        let mut child = cmd
+            .spawn()
+            .with_context(|| format!("spawn {}", &cmd_args[0]))?;
         // The parent has no use for the slave; only the child does.
-        unsafe { libc::close(slave); }
+        unsafe {
+            libc::close(slave);
+        }
         CHILD_PID.store(child.id() as i32, Ordering::SeqCst);
         install_signal_forwarders();
 
@@ -1133,16 +2185,22 @@ mod pty {
             let mut buf = [0u8; 1024];
             loop {
                 let n = unsafe { libc::read(0, buf.as_mut_ptr() as *mut _, buf.len()) };
-                if n <= 0 { break; }
+                if n <= 0 {
+                    break;
+                }
                 let mut off = 0usize;
                 while off < n as usize {
                     let w = unsafe {
                         libc::write(master, buf[off..].as_ptr() as *const _, (n as usize) - off)
                     };
-                    if w <= 0 { break; }
+                    if w <= 0 {
+                        break;
+                    }
                     off += w as usize;
                 }
-                if off < n as usize { break; }
+                if off < n as usize {
+                    break;
+                }
             }
         });
 
@@ -1155,7 +2213,9 @@ mod pty {
         let status = child.wait().context("wait child")?;
         CHILD_PID.store(0, Ordering::SeqCst);
         MASTER.store(-1, Ordering::SeqCst);
-        unsafe { libc::signal(libc::SIGWINCH, libc::SIG_DFL); }
+        unsafe {
+            libc::signal(libc::SIGWINCH, libc::SIG_DFL);
+        }
 
         // Restore the terminal before exiting (process::exit skips destructors),
         // and drop the input handle — its thread may still be blocked on read(0)
@@ -1202,7 +2262,9 @@ fn cmd_import(args: &[String]) -> Result<()> {
     // can be resolved per key rather than picking one file upfront.
     let pairs: Vec<(String, String)> = if from_env {
         if let Some(name) = from_env_name {
-            if !store::valid_key_name(&name) { bail!("invalid variable name: {name:?}") }
+            if !store::valid_key_name(&name) {
+                bail!("invalid variable name: {name:?}")
+            }
             if is_unsafe_env_name(&name) {
                 bail!("unsafe env name: {name} — cannot enter the store");
             }
@@ -1216,14 +2278,25 @@ fn cmd_import(args: &[String]) -> Result<()> {
                 .collect()
         }
     } else if from_stdin {
-        let lines: Vec<String> = io::stdin().lock().lines()
-            .collect::<Result<Vec<_>, _>>().context("reading stdin")?;
-        join_multiline_lines(lines).iter().filter_map(|l| parse_env_line(l)).collect()
+        let lines: Vec<String> = io::stdin()
+            .lock()
+            .lines()
+            .collect::<Result<Vec<_>, _>>()
+            .context("reading stdin")?;
+        join_multiline_lines(lines)
+            .iter()
+            .filter_map(|l| parse_env_line(l))
+            .collect()
     } else if let Some(f) = file_arg {
         let lines: Vec<String> = std::fs::read_to_string(&f)
             .with_context(|| format!("reading {f}"))?
-            .lines().map(String::from).collect();
-        join_multiline_lines(lines).iter().filter_map(|l| parse_env_line(l)).collect()
+            .lines()
+            .map(String::from)
+            .collect();
+        join_multiline_lines(lines)
+            .iter()
+            .filter_map(|l| parse_env_line(l))
+            .collect()
     } else {
         bail!("usage: s import <file> | --stdin | --from-env [NAME]");
     };
@@ -1289,19 +2362,27 @@ fn strip_quotes(s: &str) -> String {
 /// names (LD_PRELOAD etc. must never enter the store).
 fn parse_env_line(line: &str) -> Option<(String, String)> {
     let trimmed = line.trim();
-    if trimmed.is_empty() || trimmed.starts_with('#') { return None }
+    if trimmed.is_empty() || trimmed.starts_with('#') {
+        return None;
+    }
     let trimmed = trimmed.strip_prefix("export ").unwrap_or(trimmed);
     let (k, v) = trimmed.split_once('=')?;
     let k = k.trim();
-    if !store::valid_key_name(k) { return None }
-    if is_unsafe_env_name(k) { return None }
+    if !store::valid_key_name(k) {
+        return None;
+    }
+    if is_unsafe_env_name(k) {
+        return None;
+    }
     Some((k.to_string(), strip_quotes(v.trim())))
 }
 
 /// Count the outer single-quote pair, ignoring export's embedded `\\'` token.
 /// Even means the closing quote is on this line.
 fn is_quote_balanced(line: &str) -> bool {
-    let Some((_k, v)) = line.split_once('=') else { return true };
+    let Some((_k, v)) = line.split_once('=') else {
+        return true;
+    };
     v.replace("'\\''", "").matches('\'').count() % 2 == 0
 }
 
@@ -1335,12 +2416,31 @@ fn join_multiline_lines(lines: Vec<String>) -> Vec<String> {
 }
 
 fn is_boring_env(k: &str) -> bool {
-    matches!(k,
-        "HOME" | "USER" | "SHELL" | "PATH" | "PWD" | "OLDPWD" | "TERM"
-        | "LANG" | "LC_ALL" | "LC_CTYPE" | "EDITOR" | "VISUAL" | "PAGER"
-        | "HOSTNAME" | "LOGNAME" | "SHLVL" | "TMPDIR" | "_"
-        | "XDG_CONFIG_HOME" | "XDG_DATA_HOME" | "XDG_CACHE_HOME" | "XDG_RUNTIME_DIR"
-        | "S_KEY"
+    matches!(
+        k,
+        "HOME"
+            | "USER"
+            | "SHELL"
+            | "PATH"
+            | "PWD"
+            | "OLDPWD"
+            | "TERM"
+            | "LANG"
+            | "LC_ALL"
+            | "LC_CTYPE"
+            | "EDITOR"
+            | "VISUAL"
+            | "PAGER"
+            | "HOSTNAME"
+            | "LOGNAME"
+            | "SHLVL"
+            | "TMPDIR"
+            | "_"
+            | "XDG_CONFIG_HOME"
+            | "XDG_DATA_HOME"
+            | "XDG_CACHE_HOME"
+            | "XDG_RUNTIME_DIR"
+            | "S_KEY"
     )
 }
 
@@ -1353,7 +2453,9 @@ fn cmd_export(args: &[String]) -> Result<()> {
         match args[i].as_str() {
             "--file" | "--env-file" => {
                 i += 1;
-                if i >= args.len() { bail!("--file requires a path") }
+                if i >= args.len() {
+                    bail!("--file requires a path")
+                }
                 out_file = Some(args[i].clone());
             }
             other => bail!("unknown flag: {other}"),
@@ -1383,11 +2485,14 @@ fn cmd_export(args: &[String]) -> Result<()> {
 // --- history / rollback ---------------------------------------------------
 
 fn cmd_history(args: &[String]) -> Result<()> {
-    if args.is_empty() { bail!("usage: s history <NAME>") }
+    if args.is_empty() {
+        bail!("usage: s history <NAME>")
+    }
     ensure_store()?;
     let key = &args[0];
     let merged = merged_keys()?;
-    let entry = merged.get(key.as_str())
+    let entry = merged
+        .get(key.as_str())
         .ok_or_else(|| anyhow!("key {key} not found"))?;
     println!("history for {key}\n");
     println!("  ● current (active)");
@@ -1412,7 +2517,9 @@ fn cmd_rollback(args: &[String]) -> Result<()> {
         match args[i].as_str() {
             "--to" => {
                 i += 1;
-                if i >= args.len() { bail!("--to requires a version number") }
+                if i >= args.len() {
+                    bail!("--to requires a version number")
+                }
                 to = Some(args[i].parse().context("version must be a number")?);
             }
             other if key.is_none() => key = Some(other.to_string()),
@@ -1422,14 +2529,15 @@ fn cmd_rollback(args: &[String]) -> Result<()> {
     }
     let key = key.ok_or_else(|| anyhow!("usage: s rollback <NAME> --to N"))?;
     let n = to.ok_or_else(|| anyhow!("usage: s rollback <NAME> --to N"))?;
-    let path = store_containing(&key)?
-        .ok_or_else(|| anyhow!("key {key} not found"))?;
+    let path = store_containing(&key)?.ok_or_else(|| anyhow!("key {key} not found"))?;
     // Re-encrypting the restored blob needs the password, which also makes
     // rollback an authenticated action — a revoked credential cannot be
     // silently reinstated without it.
     let pw = get_password()?;
     let mut file = store::SenvFile::load(&path)?;
-    let entry = file.keys.get_mut(key.as_str())
+    let entry = file
+        .keys
+        .get_mut(key.as_str())
         .ok_or_else(|| anyhow!("key {key} not found"))?;
     entry.rollback(n, &pw, &key)?;
     file.save(&path)?;
@@ -1457,7 +2565,9 @@ fn cmd_scan(args: &[String]) -> Result<()> {
             "--staged" => staged = true,
             "--path" => {
                 i += 1;
-                if i >= args.len() { bail!("--path requires a directory") }
+                if i >= args.len() {
+                    bail!("--path requires a directory")
+                }
                 scan_path = Some(args[i].clone());
             }
             other => bail!("unknown flag: {other}"),
@@ -1471,7 +2581,9 @@ fn cmd_scan(args: &[String]) -> Result<()> {
     let mut secrets: Vec<(&str, &[u8])> = Vec::new();
     let mut too_short: Vec<&str> = Vec::new();
     for (k, v) in &entries {
-        if v.is_empty() { continue }
+        if v.is_empty() {
+            continue;
+        }
         if v.len() < 8 {
             too_short.push(k.as_str());
         } else {
@@ -1504,21 +2616,32 @@ fn cmd_scan(args: &[String]) -> Result<()> {
     let mut units: Vec<ScanUnit> = Vec::new();
     let mut unreadable: Vec<(String, String)> = Vec::new();
     for path in &paths {
-        if is_store_path(path, &store_paths) { continue }
+        if is_store_path(path, &store_paths) {
+            continue;
+        }
         let bytes = if staged {
             // Read the staged blob from the index, never the worktree: a file
             // cleaned up in the worktree but still staged must still be caught.
             match staged_blob_bytes(path) {
                 Ok(b) => b,
-                Err(e) => { unreadable.push((path.clone(), format!("{e}"))); continue }
+                Err(e) => {
+                    unreadable.push((path.clone(), format!("{e}")));
+                    continue;
+                }
             }
         } else {
             match std::fs::read(path) {
                 Ok(b) => b,
-                Err(e) => { unreadable.push((path.clone(), e.to_string())); continue }
+                Err(e) => {
+                    unreadable.push((path.clone(), e.to_string()));
+                    continue;
+                }
             }
         };
-        units.push(ScanUnit { path: path.clone(), bytes });
+        units.push(ScanUnit {
+            path: path.clone(),
+            bytes,
+        });
     }
 
     // Search the whole byte content so multi-line secrets (e.g. PEM keys) can
@@ -1550,7 +2673,11 @@ fn cmd_scan(args: &[String]) -> Result<()> {
     }
     let unique: std::collections::HashSet<&str> =
         found.iter().map(|(f, _, _)| f.as_str()).collect();
-    eprintln!("found {} secret(s) in {} file(s)", found.len(), unique.len());
+    eprintln!(
+        "found {} secret(s) in {} file(s)",
+        found.len(),
+        unique.len()
+    );
     std::process::exit(1);
 }
 
@@ -1560,12 +2687,21 @@ fn cmd_scan(args: &[String]) -> Result<()> {
 fn collect_scan_paths(staged: bool, scan_path: Option<&str>) -> Result<Vec<String>> {
     if staged {
         let out = Command::new("git")
-            .args(["diff", "--cached", "-z", "--name-only", "--diff-filter=ACMR"])
-            .output().context("running git diff")?;
+            .args([
+                "diff",
+                "--cached",
+                "-z",
+                "--name-only",
+                "--diff-filter=ACMR",
+            ])
+            .output()
+            .context("running git diff")?;
         return Ok(split_nul(&out.stdout));
     }
     let dir = scan_path.unwrap_or(".");
-    let out = Command::new("git").args(["ls-files", "-z", "--", dir]).output();
+    let out = Command::new("git")
+        .args(["ls-files", "-z", "--", dir])
+        .output();
     if let Ok(out) = out {
         if out.status.success() {
             return Ok(split_nul(&out.stdout));
@@ -1577,7 +2713,8 @@ fn collect_scan_paths(staged: bool, scan_path: Option<&str>) -> Result<Vec<Strin
 }
 
 fn split_nul(bytes: &[u8]) -> Vec<String> {
-    bytes.split(|&b| b == 0)
+    bytes
+        .split(|&b| b == 0)
         .filter(|s| !s.is_empty())
         .map(|s| String::from_utf8_lossy(s).into_owned())
         .collect()
@@ -1599,7 +2736,9 @@ fn staged_blob_bytes(path: &str) -> Result<Vec<u8>> {
 }
 
 fn find_subsequence(hay: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() { return None; }
+    if needle.is_empty() {
+        return None;
+    }
     hay.windows(needle.len()).position(|w| w == needle)
 }
 
@@ -1622,7 +2761,9 @@ fn walk_dir(dir: &Path, out: &mut Vec<String>) -> Result<()> {
         if ft.is_dir() {
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if name.starts_with('.') || name == "node_modules" || name == "target" { continue }
+            if name.starts_with('.') || name == "node_modules" || name == "target" {
+                continue;
+            }
             walk_dir(&path, out)?;
         } else if ft.is_file() {
             out.push(path.to_string_lossy().to_string());
@@ -1635,7 +2776,11 @@ fn walk_dir(dir: &Path, out: &mut Vec<String>) -> Result<()> {
 
 fn confirm_overwrite(key: &str) -> Result<bool> {
     use std::io::BufReader;
-    let tty = match std::fs::OpenOptions::new().read(true).write(true).open("/dev/tty") {
+    let tty = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+    {
         Ok(f) => f,
         Err(_) => {
             eprintln!("s: key {key} already exists; pass -f to overwrite");
@@ -1646,6 +2791,8 @@ fn confirm_overwrite(key: &str) -> Result<bool> {
     write!(tty_w, "overwrite existing {key}? [y/N] ")?;
     tty_w.flush()?;
     let mut line = String::new();
-    BufReader::new(tty).read_line(&mut line).context("reading from /dev/tty")?;
+    BufReader::new(tty)
+        .read_line(&mut line)
+        .context("reading from /dev/tty")?;
     Ok(matches!(line.trim(), "y" | "Y" | "yes" | "YES"))
 }

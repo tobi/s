@@ -16,7 +16,10 @@ use std::process::{Command, Stdio};
 
 use argon2::{Algorithm, Argon2, Params, Version};
 use base64::prelude::*;
-use chacha20poly1305::{aead::{Aead, KeyInit, Payload}, ChaCha20Poly1305, Key, Nonce};
+use chacha20poly1305::{
+    aead::{Aead, KeyInit, Payload},
+    ChaCha20Poly1305, Key, Nonce,
+};
 use std::time::{Duration, Instant};
 
 pub const PW: &str = "test-password";
@@ -73,7 +76,9 @@ impl Run {
 
 impl Fixture {
     pub fn new() -> Fixture {
-        Fixture { tmp: tempfile::tempdir().expect("tempdir") }
+        Fixture {
+            tmp: tempfile::tempdir().expect("tempdir"),
+        }
     }
 
     pub fn new_git() -> Fixture {
@@ -181,13 +186,22 @@ impl Fixture {
                 None => c.env_remove(k),
             };
         }
-        c.stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() });
+        c.stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        });
         c.stdout(Stdio::piped());
         c.stderr(Stdio::piped());
 
         let mut child = c.spawn().expect("spawn s");
         if let Some(data) = stdin {
-            child.stdin.take().unwrap().write_all(data.as_bytes()).unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(data.as_bytes())
+                .unwrap();
         }
         Fixture::finish(child.wait_with_output().expect("wait s"))
     }
@@ -220,13 +234,22 @@ impl Fixture {
             .unwrap();
         let cipher = ChaCha20Poly1305::new(Key::from_slice(&derived));
         let ciphertext = cipher
-            .encrypt(Nonce::from_slice(&nonce), Payload { msg: value.as_bytes(), aad: b"" })
+            .encrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: value.as_bytes(),
+                    aad: b"",
+                },
+            )
             .unwrap();
         let mut packed = Vec::with_capacity(16 + 12 + ciphertext.len());
         packed.extend_from_slice(&salt);
         packed.extend_from_slice(&nonce);
         packed.extend_from_slice(&ciphertext);
-        self.write(".senv", format!("keys:\n  {key}: \"{}\"\n", BASE64_STANDARD.encode(packed)));
+        self.write(
+            ".senv",
+            format!("keys:\n  {key}: \"{}\"\n", BASE64_STANDARD.encode(packed)),
+        );
     }
 
     /// Run a shell script with the fixture environment, giving up after
@@ -237,7 +260,11 @@ impl Fixture {
         self.apply_env(&mut c);
         // Scripts invoke `s` by name.
         let path = std::env::var("PATH").unwrap_or_default();
-        let bin_dir = Path::new(BIN).parent().unwrap().to_string_lossy().into_owned();
+        let bin_dir = Path::new(BIN)
+            .parent()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
         c.env("PATH", format!("{bin_dir}:{path}"));
         c.stdin(Stdio::null());
         c.stdout(Stdio::piped());
@@ -269,9 +296,7 @@ impl Fixture {
 
         let (master, slave) = open_pty();
 
-        let (stdin_fd, stdout_fd, stderr_fd) = unsafe {
-            (dup(slave), dup(slave), dup(slave))
-        };
+        let (stdin_fd, stdout_fd, stderr_fd) = unsafe { (dup(slave), dup(slave), dup(slave)) };
         let mut c = Command::new(BIN);
         c.args(args);
         self.apply_env(&mut c);
@@ -333,14 +358,22 @@ unsafe fn dup(fd: i32) -> i32 {
 fn open_pty() -> (i32, i32) {
     unsafe {
         let master = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
-        assert!(master >= 0, "posix_openpt: {}", std::io::Error::last_os_error());
+        assert!(
+            master >= 0,
+            "posix_openpt: {}",
+            std::io::Error::last_os_error()
+        );
         assert_eq!(libc::grantpt(master), 0, "grantpt");
         assert_eq!(libc::unlockpt(master), 0, "unlockpt");
         let name = libc::ptsname(master);
         assert!(!name.is_null(), "ptsname");
         let path = std::ffi::CStr::from_ptr(name).to_owned();
         let slave = libc::open(path.as_ptr(), libc::O_RDWR);
-        assert!(slave >= 0, "open slave: {}", std::io::Error::last_os_error());
+        assert!(
+            slave >= 0,
+            "open slave: {}",
+            std::io::Error::last_os_error()
+        );
         (master, slave)
     }
 }

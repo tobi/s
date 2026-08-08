@@ -25,13 +25,19 @@ fn named_only_injects_named_secret() {
     f.set("API_KEY", "alpha-secret-aaaa");
     f.set("DB_URL", "beta-secret-bbbb");
     let r = f.s(&[
-        "API_KEY", "--", "sh", "-c",
+        "API_KEY",
+        "--",
+        "sh",
+        "-c",
         "echo API=${API_KEY:+present}; echo DB=${DB_URL:+present}",
     ]);
     let out = r.out();
     assert_eq!(r.code, 0, "{}", r.all());
     assert!(out.contains("API=present"), "named secret injected: {out}");
-    assert!(!out.contains("DB=present"), "unnamed secret must not be injected: {out}");
+    assert!(
+        !out.contains("DB=present"),
+        "unnamed secret must not be injected: {out}"
+    );
 }
 
 /// `s -- cmd` (no names) injects nothing — the safe default.
@@ -42,7 +48,10 @@ fn empty_only_injects_nothing() {
     let r = f.s(&["--", "sh", "-c", "echo API=${API_KEY:+present}"]);
     let out = r.out();
     assert_eq!(r.code, 0, "{}", r.all());
-    assert!(!out.contains("present"), "no secrets injected with bare --: {out}");
+    assert!(
+        !out.contains("present"),
+        "no secrets injected with bare --: {out}"
+    );
 }
 
 /// A corrupt / foreign-password entry must NOT break `s GOOD_KEY -- cmd`. The
@@ -69,10 +78,29 @@ fn foreign_password_entry_does_not_break_named_lookup() {
     f1_yaml.push_str(&format!("  BAD_KEY: \"{bad_blob}\"\n"));
     f.write(".senv", f1_yaml);
 
-    let r = f.s(&["GOOD_KEY", "--", "sh", "-c", "echo GOOD=${GOOD_KEY:+present}"]);
-    assert_eq!(r.code, 0, "named lookup survives foreign sibling: {}", r.all());
-    assert!(r.out().contains("GOOD=present"), "good key still works: {}", r.out());
-    assert!(!r.stderr.contains("BAD_KEY"), "foreign entry never touched: {}", r.stderr);
+    let r = f.s(&[
+        "GOOD_KEY",
+        "--",
+        "sh",
+        "-c",
+        "echo GOOD=${GOOD_KEY:+present}",
+    ]);
+    assert_eq!(
+        r.code,
+        0,
+        "named lookup survives foreign sibling: {}",
+        r.all()
+    );
+    assert!(
+        r.out().contains("GOOD=present"),
+        "good key still works: {}",
+        r.out()
+    );
+    assert!(
+        !r.stderr.contains("BAD_KEY"),
+        "foreign entry never touched: {}",
+        r.stderr
+    );
 }
 
 /// `s --all -- yes | head -n1` must terminate. The old scrubber discarded write
@@ -127,8 +155,14 @@ fn scrub_redacts_stdout_and_stderr() {
     f.set("SECRET", SECRET);
     let r = f.s(&["SECRET", "--", "sh", "-c", "echo $SECRET; echo $SECRET >&2"]);
     let all = r.all();
-    assert!(!all.contains(SECRET), "secret redacted on both streams: {all}");
-    assert!(all.contains("[REDACTED]"), "redaction marker present: {all}");
+    assert!(
+        !all.contains(SECRET),
+        "secret redacted on both streams: {all}"
+    );
+    assert!(
+        all.contains("[REDACTED]"),
+        "redaction marker present: {all}"
+    );
 }
 
 /// A stored `LD_PRELOAD` is refused at injection time (ld.so really honored the
@@ -137,11 +171,26 @@ fn scrub_redacts_stdout_and_stderr() {
 fn unsafe_ld_preload_not_injected() {
     let f = Fixture::inited();
     f.inject_legacy("LD_PRELOAD", "/tmp/evil-loader.so");
-    let r = f.s(&["LD_PRELOAD", "--", "sh", "-c", "echo LD=${LD_PRELOAD:-unset}"]);
+    let r = f.s(&[
+        "LD_PRELOAD",
+        "--",
+        "sh",
+        "-c",
+        "echo LD=${LD_PRELOAD:-unset}",
+    ]);
     let all = r.all();
-    assert!(all.contains("LD=unset"), "LD_PRELOAD not injected into child: {all}");
-    assert!(all.contains("refusing to inject LD_PRELOAD"), "warning on stderr: {all}");
-    assert!(!all.contains("/tmp/evil-loader.so"), "preload value never reaches output: {all}");
+    assert!(
+        all.contains("LD=unset"),
+        "LD_PRELOAD not injected into child: {all}"
+    );
+    assert!(
+        all.contains("refusing to inject LD_PRELOAD"),
+        "warning on stderr: {all}"
+    );
+    assert!(
+        !all.contains("/tmp/evil-loader.so"),
+        "preload value never reaches output: {all}"
+    );
 }
 
 /// A stored `S_KEY` is not injected, and the live `S_KEY` is removed after the
@@ -154,8 +203,14 @@ fn stored_s_key_not_injected() {
     let r = f.s(&["S_KEY", "--", "sh", "-c", "echo SK=${S_KEY:-unset}"]);
     let all = r.all();
     assert!(all.contains("SK=unset"), "S_KEY not in child env: {all}");
-    assert!(!all.contains("leaked-master-password"), "stored S_KEY value must not leak: {all}");
-    assert!(all.contains("refusing to inject S_KEY"), "warning emitted: {all}");
+    assert!(
+        !all.contains("leaked-master-password"),
+        "stored S_KEY value must not leak: {all}"
+    );
+    assert!(
+        all.contains("refusing to inject S_KEY"),
+        "warning emitted: {all}"
+    );
 }
 
 /// PTY mode: under a real PTY, `echo $SECRET > /dev/tty` must be redacted (the
@@ -166,12 +221,27 @@ fn pty_redacts_dev_tty_and_reports_tty() {
     let f = Fixture::inited();
     f.set("SECRET", SECRET);
     let r = f.s_pty(&[
-        "SECRET", "--", "sh", "-c",
+        "SECRET",
+        "--",
+        "sh",
+        "-c",
         "echo $SECRET > /dev/tty; test -t 1 && echo IS_TTY",
     ]);
-    assert!(r.output.contains("[REDACTED]"), "/dev/tty output redacted: {}", r.output);
-    assert!(!r.output.contains(SECRET), "raw secret must not leak via /dev/tty: {}", r.output);
-    assert!(r.output.contains("IS_TTY"), "child stdout is a tty: {}", r.output);
+    assert!(
+        r.output.contains("[REDACTED]"),
+        "/dev/tty output redacted: {}",
+        r.output
+    );
+    assert!(
+        !r.output.contains(SECRET),
+        "raw secret must not leak via /dev/tty: {}",
+        r.output
+    );
+    assert!(
+        r.output.contains("IS_TTY"),
+        "child stdout is a tty: {}",
+        r.output
+    );
 }
 
 /// Signal forwarding: killing the wrapper forwards the signal to the child and
@@ -206,6 +276,12 @@ fn forwards_signal_and_reaps_child() {
         .output()
         .expect("run");
     let s = String::from_utf8_lossy(&out.stdout);
-    assert!(s.contains("exit=143"), "s forwards SIGTERM and exits 143: {s}");
-    assert!(s.contains("NOORPHAN"), "child was forwarded the signal, not orphaned: {s}");
+    assert!(
+        s.contains("exit=143"),
+        "s forwards SIGTERM and exits 143: {s}"
+    );
+    assert!(
+        s.contains("NOORPHAN"),
+        "child was forwarded the signal, not orphaned: {s}"
+    );
 }

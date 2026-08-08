@@ -39,9 +39,12 @@ impl Scrubber {
         for s in &secrets {
             starts[s[0] as usize] = true;
         }
-        Scrubber { secrets, max_len, starts }
+        Scrubber {
+            secrets,
+            max_len,
+            starts,
+        }
     }
-
 
     /// How many trailing bytes of `hay` must be held back because they could
     /// still grow into a secret on the next read.
@@ -56,7 +59,11 @@ impl Scrubber {
             if !self.starts[tail[0] as usize] {
                 continue;
             }
-            if self.secrets.iter().any(|s| s.len() > len && s.starts_with(tail)) {
+            if self
+                .secrets
+                .iter()
+                .any(|s| s.len() > len && s.starts_with(tail))
+            {
                 return len;
             }
         }
@@ -95,7 +102,11 @@ impl Scrubber {
                 continue;
             }
             // Longest first, so the first hit at this offset covers the most.
-            if let Some(len) = self.secrets.iter().find(|s| src[i..].starts_with(s)).map(|s| s.len())
+            if let Some(len) = self
+                .secrets
+                .iter()
+                .find(|s| src[i..].starts_with(s))
+                .map(|s| s.len())
             {
                 cover[i..i + len].fill(true);
                 limit = limit.max(i + len);
@@ -196,7 +207,11 @@ mod tests {
             }
         }
         let sc = Scrubber::new(&secrets(secs));
-        let mut r = Chunked { data: input.as_bytes(), pos: 0, chunk };
+        let mut r = Chunked {
+            data: input.as_bytes(),
+            pos: 0,
+            chunk,
+        };
         let mut w: Vec<u8> = Vec::new();
         sc.copy(&mut r, &mut w).unwrap();
         String::from_utf8(w).unwrap()
@@ -214,16 +229,25 @@ mod tests {
 
     #[test]
     fn redacts_every_occurrence() {
-        assert_eq!(stream("a S a S a", &["S"], 4096), "a [REDACTED] a [REDACTED] a");
+        assert_eq!(
+            stream("a S a S a", &["S"], 4096),
+            "a [REDACTED] a [REDACTED] a"
+        );
     }
 
     /// The bug: with A a prefix of B, first-match-wins redacted A and emitted
     /// the remainder of B in the clear.
     #[test]
     fn longest_secret_wins_over_a_shorter_prefix() {
-        assert_eq!(stream("x abc123xyz789 y", &["abc123", "abc123xyz789"], 4096), "x [REDACTED] y");
+        assert_eq!(
+            stream("x abc123xyz789 y", &["abc123", "abc123xyz789"], 4096),
+            "x [REDACTED] y"
+        );
         // ... and in the other insertion order, since the old code depended on it.
-        assert_eq!(stream("x abc123xyz789 y", &["abc123xyz789", "abc123"], 4096), "x [REDACTED] y");
+        assert_eq!(
+            stream("x abc123xyz789 y", &["abc123xyz789", "abc123"], 4096),
+            "x [REDACTED] y"
+        );
     }
 
     /// Overlap rather than prefix: "AB" must not shadow "BCDEF".
@@ -235,13 +259,20 @@ mod tests {
 
     #[test]
     fn shorter_secret_still_redacted_on_its_own() {
-        assert_eq!(stream("abc123 end", &["abc123", "abc123xyz789"], 4096), "[REDACTED] end");
+        assert_eq!(
+            stream("abc123 end", &["abc123", "abc123xyz789"], 4096),
+            "[REDACTED] end"
+        );
     }
 
     #[test]
     fn catches_a_secret_split_across_reads() {
         for chunk in 1..=8 {
-            assert_eq!(stream("pre-abc123-post", &["abc123"], chunk), "pre-[REDACTED]-post", "chunk={chunk}");
+            assert_eq!(
+                stream("pre-abc123-post", &["abc123"], chunk),
+                "pre-[REDACTED]-post",
+                "chunk={chunk}"
+            );
         }
     }
 
@@ -278,7 +309,10 @@ mod tests {
     /// At EOF nothing may be withheld, or the tail of the stream disappears.
     #[test]
     fn flushes_a_partial_match_at_eof() {
-        assert_eq!(stream("noise SECRET", &["SECRETVALUE"], 4096), "noise SECRET");
+        assert_eq!(
+            stream("noise SECRET", &["SECRETVALUE"], 4096),
+            "noise SECRET"
+        );
     }
 
     #[test]
@@ -345,8 +379,16 @@ mod tests {
     fn binary_output_survives() {
         let sc = Scrubber::new(&secrets(&["KEY"]));
         let mut out = Vec::new();
-        sc.scrub_into(&[0x00, 0xff, b'K', b'E', b'Y', 0xfe], &mut out, &mut Vec::new(), true);
-        assert_eq!(out, [0x00, 0xff, b'[', b'R', b'E', b'D', b'A', b'C', b'T', b'E', b'D', b']', 0xfe]);
+        sc.scrub_into(
+            &[0x00, 0xff, b'K', b'E', b'Y', 0xfe],
+            &mut out,
+            &mut Vec::new(),
+            true,
+        );
+        assert_eq!(
+            out,
+            [0x00, 0xff, b'[', b'R', b'E', b'D', b'A', b'C', b'T', b'E', b'D', b']', 0xfe]
+        );
     }
 
     #[test]
@@ -355,6 +397,9 @@ mod tests {
     fn adjacent_secrets_collapse_into_one_redaction() {
         assert_eq!(stream("AABB", &["AA", "BB"], 4096), "[REDACTED]");
         // Separated secrets stay separate.
-        assert_eq!(stream("AA BB", &["AA", "BB"], 4096), "[REDACTED] [REDACTED]");
+        assert_eq!(
+            stream("AA BB", &["AA", "BB"], 4096),
+            "[REDACTED] [REDACTED]"
+        );
     }
 }

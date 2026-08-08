@@ -7,10 +7,14 @@
 //     history:
 //       - blob: "s2:<base64>"
 //         ts: "2026-04-11T14:30:00Z"
+// domains:
+//   api.stripe.com:
+//     headers:
+//       Authorization: "Bearer $STRIPE_KEY"
 //
 // Each value is independently encrypted with ChaCha20-Poly1305 under a key
-// derived from the store password. No recipient field — whoever has the
-// password can decrypt.
+// derived from the store password. Domain/header policy is plaintext and can
+// reuse the same encrypted key differently for each destination.
 
 use anyhow::{bail, Context, Result};
 use argon2::{Algorithm, Argon2, Params, Version};
@@ -43,11 +47,19 @@ const V2_PREFIX: &str = "s2:";
 /// "wrong password", sending users to look for a lost password instead of a
 /// version mismatch. Pinning means the scheme prefix, not the crate version,
 /// decides how a key is derived.
-const ARGON2_V2: Argon2Cost = Argon2Cost { m_cost: 19 * 1024, t_cost: 2, p_cost: 1 };
+const ARGON2_V2: Argon2Cost = Argon2Cost {
+    m_cost: 19 * 1024,
+    t_cost: 2,
+    p_cost: 1,
+};
 
 /// The cost `Argon2::default()` had when v1 blobs were written. Frozen so v1
 /// stays readable no matter what happens to the crate default or to `ARGON2_V2`.
-const ARGON2_V1: Argon2Cost = Argon2Cost { m_cost: 19 * 1024, t_cost: 2, p_cost: 1 };
+const ARGON2_V1: Argon2Cost = Argon2Cost {
+    m_cost: 19 * 1024,
+    t_cost: 2,
+    p_cost: 1,
+};
 
 struct Argon2Cost {
     m_cost: u32,
@@ -59,15 +71,24 @@ struct Argon2Cost {
 pub struct SenvFile {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub keys: BTreeMap<String, KeyEntry>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub domains: BTreeMap<String, DomainPolicy>,
 }
 
-/// Bare string for simple keys, struct when history exists.
+#[derive(Serialize, Deserialize, Default, Clone)]
+pub struct DomainPolicy {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers: BTreeMap<String, String>,
+}
+
+/// Bare string for simple keys; a struct once history exists.
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(untagged)]
 pub enum KeyEntry {
     Simple(String),
-    WithHistory {
+    Detailed {
         value: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
         history: Vec<HistoryEntry>,
     },
 }
@@ -76,25 +97,34 @@ impl KeyEntry {
     pub fn value(&self) -> &str {
         match self {
             KeyEntry::Simple(v) => v,
-            KeyEntry::WithHistory { value, .. } => value,
+            KeyEntry::Detailed { value, .. } => value,
         }
     }
 
     pub fn history(&self) -> &[HistoryEntry] {
         match self {
             KeyEntry::Simple(_) => &[],
-            KeyEntry::WithHistory { history, .. } => history,
+            KeyEntry::Detailed { history, .. } => history,
         }
     }
 
     /// Install `new_blob`, pushing the current value onto the history stack.
     pub fn update(&mut self, new_blob: String, password: &str, key_name: &str) -> Result<()> {
         let old = self.value().to_string();
-        let mut hist: Vec<HistoryEntry> = self.history().to_vec();
-        hist.insert(0, HistoryEntry { blob: old, ts: now_iso() });
-        hist.truncate(MAX_HISTORY);
-        upgrade_history(&mut hist, password, key_name);
-        *self = KeyEntry::WithHistory { value: new_blob, history: hist };
+        let mut history: Vec<HistoryEntry> = self.history().to_vec();
+        history.insert(
+            0,
+            HistoryEntry {
+                blob: old,
+                ts: now_iso(),
+            },
+        );
+        history.truncate(MAX_HISTORY);
+        upgrade_history(&mut history, password, key_name);
+        *self = KeyEntry::Detailed {
+            value: new_blob,
+            history,
+        };
         Ok(())
     }
 
@@ -105,18 +135,27 @@ impl KeyEntry {
     /// the re-encryption cannot happen, so a rollback cannot silently reinstate
     /// a revoked credential.
     pub fn rollback(&mut self, n: usize, password: &str, key_name: &str) -> Result<()> {
-        let mut hist = self.history().to_vec();
-        if n == 0 || n > hist.len() {
-            bail!("version {n} not found ({} in history)", hist.len());
+        let mut history = self.history().to_vec();
+        if n == 0 || n > history.len() {
+            bail!("version {n} not found ({} in history)", history.len());
         }
-        let restored = hist.remove(n - 1);
+        let restored = history.remove(n - 1);
         let restored_blob = reencrypt_value(&restored.blob, password, key_name)
             .context("restoring history entry")?;
 
-        hist.insert(0, HistoryEntry { blob: self.value().to_string(), ts: now_iso() });
-        hist.truncate(MAX_HISTORY);
-        upgrade_history(&mut hist, password, key_name);
-        *self = KeyEntry::WithHistory { value: restored_blob, history: hist };
+        history.insert(
+            0,
+            HistoryEntry {
+                blob: self.value().to_string(),
+                ts: now_iso(),
+            },
+        );
+        history.truncate(MAX_HISTORY);
+        upgrade_history(&mut history, password, key_name);
+        *self = KeyEntry::Detailed {
+            value: restored_blob,
+            history,
+        };
         Ok(())
     }
 }
@@ -152,8 +191,8 @@ pub struct HistoryEntry {
 
 impl SenvFile {
     pub fn load(path: &Path) -> Result<Self> {
-        let raw = std::fs::read_to_string(path)
-            .with_context(|| format!("reading {}", path.display()))?;
+        let raw =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         serde_yaml::from_str(&raw).with_context(|| format!("parsing {}", path.display()))
     }
 
@@ -222,7 +261,10 @@ pub fn encrypt_value(plaintext: &str, password: &str, key_name: &str) -> Result<
     let ct = cipher
         .encrypt(
             Nonce::from_slice(&nonce_bytes),
-            Payload { msg: plaintext.as_bytes(), aad: key_name.as_bytes() },
+            Payload {
+                msg: plaintext.as_bytes(),
+                aad: key_name.as_bytes(),
+            },
         )
         .map_err(|e| anyhow::anyhow!("encrypt: {e}"))?;
 
@@ -238,7 +280,9 @@ pub fn decrypt_value(blob: &str, password: &str, key_name: &str) -> Result<Strin
     let legacy = !blob.starts_with(V2_PREFIX);
     let b64 = blob.strip_prefix(V2_PREFIX).unwrap_or(blob);
 
-    let packed = BASE64_STANDARD.decode(b64.as_bytes()).context("base64 decode")?;
+    let packed = BASE64_STANDARD
+        .decode(b64.as_bytes())
+        .context("base64 decode")?;
     if packed.len() < SALT_LEN + NONCE_LEN + TAG_LEN {
         bail!("blob too short");
     }
@@ -282,7 +326,9 @@ pub fn is_legacy_blob(blob: &str) -> bool {
 
 fn try_decrypt(key: &[u8; 32], nonce: &[u8], ct: &[u8], aad: &[u8]) -> Option<Vec<u8>> {
     let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
-    cipher.decrypt(Nonce::from_slice(nonce), Payload { msg: ct, aad }).ok()
+    cipher
+        .decrypt(Nonce::from_slice(nonce), Payload { msg: ct, aad })
+        .ok()
 }
 
 fn derive_key_argon2(
@@ -303,7 +349,8 @@ fn derive_key_argon2(
 fn derive_key_hkdf(password: &str, salt: &[u8]) -> Result<Zeroizing<[u8; 32]>> {
     let hk = Hkdf::<Sha256>::new(Some(salt), password.as_bytes());
     let mut okm = Zeroizing::new([0u8; 32]);
-    hk.expand(b"s-v1", okm.as_mut()).map_err(|e| anyhow::anyhow!("HKDF: {e}"))?;
+    hk.expand(b"s-v1", okm.as_mut())
+        .map_err(|e| anyhow::anyhow!("HKDF: {e}"))?;
     Ok(okm)
 }
 
@@ -333,11 +380,13 @@ pub fn write_private(path: &Path, data: &[u8]) -> Result<()> {
         f.set_permissions(std::fs::Permissions::from_mode(0o600))
             .with_context(|| format!("chmod {}", path.display()))?;
     }
-    f.write_all(data).with_context(|| format!("writing {}", path.display()))?;
+    f.write_all(data)
+        .with_context(|| format!("writing {}", path.display()))?;
     // A rename over unsynced data is not atomic across a crash: the directory
     // entry can land while the contents are still zeroes. For a secrets store
     // that is total loss, so pay the fsync.
-    f.sync_all().with_context(|| format!("syncing {}", path.display()))?;
+    f.sync_all()
+        .with_context(|| format!("syncing {}", path.display()))?;
     Ok(())
 }
 
@@ -399,7 +448,13 @@ mod tests {
         };
         let cipher = ChaCha20Poly1305::new(Key::from_slice(&dk[..]));
         let ct = cipher
-            .encrypt(Nonce::from_slice(&nonce), Payload { msg: plaintext.as_bytes(), aad: b"" })
+            .encrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: plaintext.as_bytes(),
+                    aad: b"",
+                },
+            )
             .unwrap();
         let mut packed = Vec::new();
         packed.extend_from_slice(&salt);
@@ -429,7 +484,9 @@ mod tests {
     #[test]
     fn v2_tamper_is_reported_as_tamper() {
         let blob = encrypt_value("v", PW, "K").unwrap();
-        let mut packed = BASE64_STANDARD.decode(blob.strip_prefix(V2_PREFIX).unwrap()).unwrap();
+        let mut packed = BASE64_STANDARD
+            .decode(blob.strip_prefix(V2_PREFIX).unwrap())
+            .unwrap();
         let last = packed.len() - 1;
         packed[last] ^= 0xff;
         let tampered = format!("{V2_PREFIX}{}", BASE64_STANDARD.encode(&packed));
@@ -441,13 +498,19 @@ mod tests {
     fn legacy_argon2_blob_still_decrypts() {
         let blob = legacy_blob("old-password", "legacy-secret", false);
         assert!(is_legacy_blob(&blob));
-        assert_eq!(decrypt_value(&blob, "old-password", "ANY").unwrap(), "legacy-secret");
+        assert_eq!(
+            decrypt_value(&blob, "old-password", "ANY").unwrap(),
+            "legacy-secret"
+        );
     }
 
     #[test]
     fn legacy_hkdf_blob_still_decrypts() {
         let blob = legacy_blob("old-password", "legacy-secret", true);
-        assert_eq!(decrypt_value(&blob, "old-password", "ANY").unwrap(), "legacy-secret");
+        assert_eq!(
+            decrypt_value(&blob, "old-password", "ANY").unwrap(),
+            "legacy-secret"
+        );
     }
 
     /// Legacy blobs carry no AAD, so the key name must be ignored for them —
@@ -477,7 +540,10 @@ mod tests {
 
         assert_eq!(entry.history().len(), 1);
         let h = &entry.history()[0];
-        assert!(!is_legacy_blob(&h.blob), "history blob was left in the legacy scheme");
+        assert!(
+            !is_legacy_blob(&h.blob),
+            "history blob was left in the legacy scheme"
+        );
         assert_eq!(decrypt_value(&h.blob, "pw", "TOKEN").unwrap(), "gen1");
     }
 
@@ -496,13 +562,18 @@ mod tests {
     #[test]
     fn rollback_restores_and_reencrypts() {
         let mut entry = KeyEntry::Simple(encrypt_value("v1", "pw", "K").unwrap());
-        entry.update(encrypt_value("v2", "pw", "K").unwrap(), "pw", "K").unwrap();
+        entry
+            .update(encrypt_value("v2", "pw", "K").unwrap(), "pw", "K")
+            .unwrap();
         entry.rollback(1, "pw", "K").unwrap();
 
         assert_eq!(decrypt_value(entry.value(), "pw", "K").unwrap(), "v1");
         assert!(!is_legacy_blob(entry.value()));
         // The value we rolled away from is still reachable.
-        assert_eq!(decrypt_value(&entry.history()[0].blob, "pw", "K").unwrap(), "v2");
+        assert_eq!(
+            decrypt_value(&entry.history()[0].blob, "pw", "K").unwrap(),
+            "v2"
+        );
     }
 
     /// Rollback reinstates a credential, so it must not be possible without the
@@ -510,7 +581,9 @@ mod tests {
     #[test]
     fn rollback_requires_the_password() {
         let mut entry = KeyEntry::Simple(encrypt_value("old", "pw", "K").unwrap());
-        entry.update(encrypt_value("new", "pw", "K").unwrap(), "pw", "K").unwrap();
+        entry
+            .update(encrypt_value("new", "pw", "K").unwrap(), "pw", "K")
+            .unwrap();
 
         let mut wrong = entry.clone();
         assert!(wrong.rollback(1, "not-the-password", "K").is_err());
@@ -533,17 +606,94 @@ mod tests {
             entry.update(blob, "pw", "K").unwrap();
         }
         assert_eq!(entry.history().len(), MAX_HISTORY);
-        assert_eq!(decrypt_value(&entry.history()[0].blob, "pw", "K").unwrap(), "v4");
+        assert_eq!(
+            decrypt_value(&entry.history()[0].blob, "pw", "K").unwrap(),
+            "v4"
+        );
     }
 
     #[test]
     fn set_key_on_new_and_existing() {
         let mut f = SenvFile::default();
-        f.set_key("A", encrypt_value("1", "pw", "A").unwrap(), "pw").unwrap();
+        f.set_key("A", encrypt_value("1", "pw", "A").unwrap(), "pw")
+            .unwrap();
         assert!(f.keys["A"].history().is_empty());
-        f.set_key("A", encrypt_value("2", "pw", "A").unwrap(), "pw").unwrap();
+        f.set_key("A", encrypt_value("2", "pw", "A").unwrap(), "pw")
+            .unwrap();
         assert_eq!(f.keys["A"].history().len(), 1);
         assert_eq!(decrypt_value(f.keys["A"].value(), "pw", "A").unwrap(), "2");
+    }
+
+    #[test]
+    fn domain_policy_serializes_at_top_level() {
+        let yaml = "\
+keys:
+  API_KEY: encrypted
+  OLD_KEY:
+    value: old-encrypted
+    history: []
+domains:
+  api.example.com:
+    headers:
+      Authorization: Bearer $API_KEY
+  '*.example.net':
+    headers:
+      X-Token: $API_KEY
+";
+        let file: SenvFile = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            file.domains["api.example.com"].headers["Authorization"],
+            "Bearer $API_KEY"
+        );
+        assert_eq!(file.domains["*.example.net"].headers["X-Token"], "$API_KEY");
+        assert!(file.keys["OLD_KEY"].history().is_empty());
+
+        let encoded = serde_yaml::to_string(&file).unwrap();
+        let decoded: SenvFile = serde_yaml::from_str(&encoded).unwrap();
+        assert_eq!(
+            decoded.domains["api.example.com"].headers["Authorization"],
+            "Bearer $API_KEY"
+        );
+    }
+
+    #[test]
+    fn key_updates_and_rollback_preserve_top_level_domains() {
+        let mut file = SenvFile::default();
+        file.domains.insert(
+            "api.example.com".to_string(),
+            DomainPolicy {
+                headers: BTreeMap::from([(
+                    "Authorization".to_string(),
+                    "Bearer $API_KEY".to_string(),
+                )]),
+            },
+        );
+        file.set_key(
+            "API_KEY",
+            encrypt_value("v1", "pw", "API_KEY").unwrap(),
+            "pw",
+        )
+        .unwrap();
+        file.set_key(
+            "API_KEY",
+            encrypt_value("v2", "pw", "API_KEY").unwrap(),
+            "pw",
+        )
+        .unwrap();
+        file.keys
+            .get_mut("API_KEY")
+            .unwrap()
+            .rollback(1, "pw", "API_KEY")
+            .unwrap();
+
+        assert_eq!(
+            file.domains["api.example.com"].headers["Authorization"],
+            "Bearer $API_KEY"
+        );
+        assert_eq!(
+            decrypt_value(file.keys["API_KEY"].value(), "pw", "API_KEY").unwrap(),
+            "v1"
+        );
     }
 
     #[test]
@@ -611,11 +761,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join(".senv");
         let mut f = SenvFile::default();
-        f.set_key("A", encrypt_value("1", "pw", "A").unwrap(), "pw").unwrap();
+        f.set_key("A", encrypt_value("1", "pw", "A").unwrap(), "pw")
+            .unwrap();
         f.save(&p).unwrap();
 
         let back = SenvFile::load(&p).unwrap();
-        assert_eq!(decrypt_value(back.keys["A"].value(), "pw", "A").unwrap(), "1");
+        assert_eq!(
+            decrypt_value(back.keys["A"].value(), "pw", "A").unwrap(),
+            "1"
+        );
         // No temp file left behind.
         let leftovers: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()

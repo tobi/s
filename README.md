@@ -50,6 +50,62 @@ you need, or opt in explicitly with `--all`.
 Scrubbing is verbatim-only: it catches the secret as written, not transformed
 copies (base64, URL-encoding, etc.). It's a strong guardrail, not a guarantee.
 
+## Domain-scoped curl
+
+`s curl` delegates to the installed `curl`, but supplies secrets only through
+headers configured for the request domain. Store the secret, then configure the
+domain:
+
+```bash
+printf '%s' "$OPENAI_API_KEY" | s set OPENAI_API_KEY --stdin
+
+s configure api.openai.com \
+  --header 'Authorization: Bearer $OPENAI_API_KEY'
+
+# The agent only needs the URL. It never handles the header or secret.
+s curl https://api.openai.com/v1/models
+```
+
+Domains are top-level policy keys, separate from encrypted keys:
+
+```yaml
+keys:
+  OPENAI_API_KEY: s2:<encrypted>
+domains:
+  api.openai.com:
+    headers:
+      Authorization: Bearer $OPENAI_API_KEY
+  uploads.example.com:
+    headers:
+      X-API-Key: $OPENAI_API_KEY
+```
+
+This lets the same key use different headers at different addresses. Repeat
+`--header` to add headers to a domain. `s configure <DOMAIN> --clear-headers`
+removes that domain policy.
+
+Domains may be exact or wildcard subdomains. `*.example.com` matches
+`api.example.com` and `deep.api.example.com`, but not the `example.com` apex.
+
+Known `$KEY` and `${KEY}` placeholders in ordinary curl option values are also
+substituted when a matching domain header authorizes that key:
+
+```bash
+s curl -H 'X-API-Key: $VENDOR_KEY' --data '{"query":"status"}' \
+  https://api.vendor.example/v1
+```
+
+The real secret is never placed in curl's argv or environment. `s` gives curl an
+unlinked `0600` config file through an inherited descriptor, then scrubs curl's
+stdout and stderr. Credentialed requests require HTTPS; `localhost`,
+`*.localhost`, and loopback IPs may use HTTP. To prevent bypasses, credentialed
+requests reject redirects, `--insecure`, `--next`, external curl config files,
+and output/trace files. Split multi-domain requests into separate `s curl`
+invocations.
+
+Domain names and header templates are plaintext policy metadata in `.senv`;
+secret values remain encrypted.
+
 ## Inline / shebang mode
 
 Scripts can declare their own secret dependencies in the shebang, so callers and agents do not need to remember to wrap them with `s`:
@@ -143,6 +199,8 @@ The encryption password is resolved in order:
 - `s get` and `s export` **refuse without a TTY** — prevents secrets leaking into agent context
 - `s list` only shows names with `[REDACTED]`
 - `s KEY -- cmd` / `s --all -- cmd` inject secrets but scrub stdout, stderr, and PTY output
+- `s curl` works without a TTY, restricts credentials to configured domains, keeps them out of argv/environment, and scrubs responses
+- `s --skill` prints concise agent instructions for exec, shebang scripts, and domain-scoped curl
 - Dangerous loader/interpreter names such as `LD_PRELOAD`, `DYLD_*`, `PATH`, and `S_KEY` are rejected on import/set and never injected
 - Pre-commit hook blocks committing leaked secret values
 
@@ -150,7 +208,7 @@ The encryption password is resolved in order:
 
 - Each secret is independently encrypted with ChaCha20-Poly1305
 - Keys are derived with **Argon2id** (memory-hard) from the password and a random per-value salt
-- `.senv` contains only encrypted blobs and is written with `0600` permissions
+- `.senv` stores encrypted values plus plaintext curl domains/header templates and is written with `0600` permissions
 - New stores are added to `.gitignore` by default; `s init --git` opts in to tracking
 - Older stores remain decryptable; writes upgrade legacy blobs to the current authenticated format
 - The master password (`S_KEY`) is stripped from injected subprocess environments

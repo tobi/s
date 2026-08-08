@@ -11,7 +11,8 @@ fn init_with_s_file_does_not_mutate_repo() {
     let global = f.path("global/senv");
     let global_str = global.to_str().unwrap();
     // S_FILE points to a global store path outside ./.senv
-    f.s_env(&["init"], &[("S_FILE", Some(global_str))], None).ok();
+    f.s_env(&["init"], &[("S_FILE", Some(global_str))], None)
+        .ok();
     // The global store is created ...
     assert!(global.exists());
     // ... but the repo is untouched: no .gitignore, no pre-commit hook.
@@ -49,15 +50,15 @@ fn init_default_gitignores_with_explanation() {
 #[test]
 fn init_git_flag_makes_store_trackable() {
     let f = Fixture::new_git();
-    f.write(
-        ".gitignore",
-        "# keep this unrelated rule\n*.log\n.senv\n",
-    );
+    f.write(".gitignore", "# keep this unrelated rule\n*.log\n.senv\n");
     let r = f.s(&["init", "--git"]);
     r.ok();
     assert!(f.path(".senv").exists());
     let content = String::from_utf8(f.read(".gitignore")).unwrap();
-    assert!(content.contains("*.log"), "unrelated ignore rules must survive");
+    assert!(
+        content.contains("*.log"),
+        "unrelated ignore rules must survive"
+    );
     assert!(
         !content.lines().any(|l| l.trim() == ".senv"),
         "--git should remove an existing exact .senv ignore"
@@ -75,9 +76,13 @@ fn lower_case_key_exec() {
     // Write to a file so the scrubber does not redact the value on stdout.
     let out = f.path("out");
     let out_str = out.to_str().unwrap();
-    f.s(
-        &["lower_key", "--", "sh", "-c", &format!("printf %s \"$lower_key\" > {out_str}")],
-    )
+    f.s(&[
+        "lower_key",
+        "--",
+        "sh",
+        "-c",
+        &format!("printf %s \"$lower_key\" > {out_str}"),
+    ])
     .ok();
     assert_eq!(String::from_utf8(f.read("out")).unwrap(), "hello");
 }
@@ -90,9 +95,13 @@ fn help_key_does_not_shadow_subcommand() {
     // With `--`, "help" is a key name — exec form runs.
     let out = f.path("out");
     let out_str = out.to_str().unwrap();
-    f.s(
-        &["help", "--", "sh", "-c", &format!("printf %s \"$help\" > {out_str}")],
-    )
+    f.s(&[
+        "help",
+        "--",
+        "sh",
+        "-c",
+        &format!("printf %s \"$help\" > {out_str}"),
+    ])
     .ok();
     assert_eq!(String::from_utf8(f.read("out")).unwrap(), "helper");
 
@@ -102,6 +111,65 @@ fn help_key_does_not_shadow_subcommand() {
     assert!(r.stderr.contains("encrypted env store"));
 }
 
+#[test]
+fn skill_is_valid_agent_facing_markdown() {
+    let f = Fixture::new();
+    let run = f.s(&["--skill"]);
+    run.ok();
+    assert!(run.stderr.is_empty(), "unexpected stderr: {}", run.stderr);
+
+    let document = run
+        .stdout
+        .strip_prefix("---\n")
+        .expect("skill must start with YAML frontmatter");
+    let (frontmatter, body) = document
+        .split_once("\n---\n")
+        .expect("skill must close YAML frontmatter");
+    let metadata: serde_yaml::Value =
+        serde_yaml::from_str(frontmatter).expect("frontmatter must be valid YAML");
+    assert_eq!(metadata["name"], "s");
+    assert_eq!(
+        metadata["description"],
+        "Use when you need to use credentials and the project uses an .senv."
+    );
+
+    for heading in [
+        "## Execute with credentials",
+        "## Credential-aware scripts",
+        "## HTTP requests",
+    ] {
+        assert!(body.contains(heading), "missing section: {heading}");
+    }
+    assert!(body.contains("s configure api.example.com"));
+    assert!(body.contains("--header 'Authorization: Bearer $API_KEY'"));
+    for unrelated in ["s set", "s get", "s import", "s export"] {
+        assert!(
+            !body.contains(unrelated),
+            "skill must stay focused, found {unrelated:?}"
+        );
+    }
+}
+
+#[test]
+fn empty_and_help_output_prioritize_agents_and_humans() {
+    let f = Fixture::new();
+    for args in [&[][..], &["--help"][..]] {
+        let run = f.s(args);
+        run.ok();
+        let agents = run.stderr.find("Agents:").expect("missing Agents section");
+        let humans = run.stderr.find("Humans:").expect("missing Humans section");
+        let commands = run
+            .stderr
+            .find("Commands:")
+            .expect("missing Commands section");
+        assert!(agents < humans && humans < commands, "{}", run.stderr);
+        assert!(run.stderr.contains("s KEY [KEY...] -- <cmd>"));
+        assert!(run.stderr.contains("s configure HOST --header"));
+        assert!(run.stderr.contains("More agent information: s --skill"));
+        assert!(run.stderr.contains("s set <NAME>"));
+        assert!(run.stderr.contains("s get <NAME>"));
+    }
+}
 #[test]
 fn set_rejects_unsafe_env_name() {
     let f = Fixture::inited();
@@ -122,16 +190,24 @@ fn rollback_requires_password() {
     f.set("API_KEY", "v2"); // pushes v1 into history
 
     // Without a password (S_KEY unset, no TTY): must fail.
-    let r = f.s_env(&["rollback", "API_KEY", "--to", "1"], &[("S_KEY", None)], None);
+    let r = f.s_env(
+        &["rollback", "API_KEY", "--to", "1"],
+        &[("S_KEY", None)],
+        None,
+    );
     r.fails();
 
     // With the password: succeeds and restores v1.
     f.s(&["rollback", "API_KEY", "--to", "1"]).ok();
     let out = f.path("out");
     let out_str = out.to_str().unwrap();
-    f.s(
-        &["API_KEY", "--", "sh", "-c", &format!("printf %s \"$API_KEY\" > {out_str}")],
-    )
+    f.s(&[
+        "API_KEY",
+        "--",
+        "sh",
+        "-c",
+        &format!("printf %s \"$API_KEY\" > {out_str}"),
+    ])
     .ok();
     assert_eq!(String::from_utf8(f.read("out")).unwrap(), "v1");
 }
@@ -181,9 +257,13 @@ fn export_import_roundtrip_special_chars() {
     // the scrubber, which would redact the value on stdout).
     let out = f2.path("out");
     let out_str = out.to_str().unwrap();
-    f2.s(
-        &["RT", "--", "sh", "-c", &format!("printf %s \"$RT\" > {out_str}")],
-    )
+    f2.s(&[
+        "RT",
+        "--",
+        "sh",
+        "-c",
+        &format!("printf %s \"$RT\" > {out_str}"),
+    ])
     .ok();
     assert_eq!(String::from_utf8(f2.read("out")).unwrap(), value);
 }
@@ -200,8 +280,12 @@ fn import_updates_global_store() {
     let local_str = local.to_str().unwrap();
 
     // 1. Create a global store and put a key in it.
-    f.s_env(&["init"], &[("S_FILE", Some(global_str)), ("XDG_CONFIG_HOME", None)], None)
-        .ok();
+    f.s_env(
+        &["init"],
+        &[("S_FILE", Some(global_str)), ("XDG_CONFIG_HOME", None)],
+        None,
+    )
+    .ok();
     f.s_env(
         &["set", "GKEY", "--stdin"],
         &[("S_FILE", Some(global_str)), ("XDG_CONFIG_HOME", None)],
@@ -210,8 +294,12 @@ fn import_updates_global_store() {
     .ok();
 
     // 2. Create a local .senv (so both stores exist for the merge).
-    f.s_env(&["init"], &[("S_FILE", Some(local_str)), ("XDG_CONFIG_HOME", None)], None)
-        .ok();
+    f.s_env(
+        &["init"],
+        &[("S_FILE", Some(local_str)), ("XDG_CONFIG_HOME", None)],
+        None,
+    )
+    .ok();
 
     // 3. Import --from-env GKEY with merge mode (S_FILE unset, HOME set).
     //    The key lives only in the global store, so it must be UPDATED there,
@@ -239,8 +327,18 @@ fn import_updates_global_store() {
     let out = f.path("out");
     let out_str = out.to_str().unwrap();
     f.s_env(
-        &["GKEY", "--", "sh", "-c", &format!("printf %s \"$GKEY\" > {out_str}")],
-        &[("S_FILE", None), ("HOME", Some(home_str)), ("XDG_CONFIG_HOME", None)],
+        &[
+            "GKEY",
+            "--",
+            "sh",
+            "-c",
+            &format!("printf %s \"$GKEY\" > {out_str}"),
+        ],
+        &[
+            ("S_FILE", None),
+            ("HOME", Some(home_str)),
+            ("XDG_CONFIG_HOME", None),
+        ],
         None,
     )
     .ok();
@@ -277,9 +375,13 @@ fn import_from_env_name_respects_force() {
 
     let out = f.path("out");
     let out_str = out.to_str().unwrap();
-    f.s(
-        &["EXISTING", "--", "sh", "-c", &format!("printf %s \"$EXISTING\" > {out_str}")],
-    )
+    f.s(&[
+        "EXISTING",
+        "--",
+        "sh",
+        "-c",
+        &format!("printf %s \"$EXISTING\" > {out_str}"),
+    ])
     .ok();
     assert_eq!(String::from_utf8(f.read("out")).unwrap(), "new_val");
 }
@@ -375,7 +477,13 @@ fn s_key_command_overrides_bang_s_key() {
     let out = f.path("out");
     let out_str = out.to_str().unwrap();
     f.s_env(
-        &["KEY", "--", "sh", "-c", &format!("printf %s \"$KEY\" > {out_str}")],
+        &[
+            "KEY",
+            "--",
+            "sh",
+            "-c",
+            &format!("printf %s \"$KEY\" > {out_str}"),
+        ],
         &[
             ("S_KEY_COMMAND", Some("printf real_pw")),
             ("S_KEY", Some("!false")),

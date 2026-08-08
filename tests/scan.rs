@@ -41,8 +41,16 @@ fn staged_scans_index_not_worktree() {
 
     let r = fx.s(&["scan", "--staged"]);
     assert_eq!(r.code, 1, "staged scan must fail; stderr:\n{}", r.stderr);
-    assert!(r.stderr.contains("cfg.txt"), "must name the file:\n{}", r.stderr);
-    assert!(r.stderr.contains("API_KEY"), "must name the key:\n{}", r.stderr);
+    assert!(
+        r.stderr.contains("cfg.txt"),
+        "must name the file:\n{}",
+        r.stderr
+    );
+    assert!(
+        r.stderr.contains("API_KEY"),
+        "must name the key:\n{}",
+        r.stderr
+    );
 }
 
 /// A file that is not valid UTF-8 (contains 0xFF) but holds the secret must be
@@ -60,7 +68,11 @@ fn non_utf8_file_is_scanned() {
 
     let r = fx.s(&["scan", "--staged"]);
     assert_eq!(r.code, 1, "non-utf8 file must be caught:\n{}", r.stderr);
-    assert!(r.stderr.contains("bin.dat"), "must name bin.dat:\n{}", r.stderr);
+    assert!(
+        r.stderr.contains("bin.dat"),
+        "must name bin.dat:\n{}",
+        r.stderr
+    );
 }
 
 /// A multi-line (PEM-style) secret committed in plaintext must be found, with a
@@ -80,7 +92,11 @@ fn multiline_secret_is_found_with_line_number() {
 
     let r = fx.s(&["scan", "--staged"]);
     assert_eq!(r.code, 1, "multiline secret must be caught:\n{}", r.stderr);
-    assert!(r.stderr.contains("leaked.key"), "must name leaked.key:\n{}", r.stderr);
+    assert!(
+        r.stderr.contains("leaked.key"),
+        "must name leaked.key:\n{}",
+        r.stderr
+    );
     assert!(
         r.stderr.contains("leaked.key:2"),
         "must report the starting line (2):\n{}",
@@ -100,7 +116,11 @@ fn non_ascii_filename_is_scanned() {
     fx.git(&["add", "créds.txt"]);
 
     let r = fx.s(&["scan", "--staged"]);
-    assert_eq!(r.code, 1, "non-ascii filename must be caught:\n{}", r.stderr);
+    assert_eq!(
+        r.code, 1,
+        "non-ascii filename must be caught:\n{}",
+        r.stderr
+    );
     assert!(
         r.stderr.contains("créds.txt"),
         "must name créds.txt:\n{}",
@@ -124,7 +144,11 @@ fn prod_senv_scanned_real_store_excluded() {
 
     let r = fx.s(&["scan", "--staged"]);
     assert_eq!(r.code, 1, "prod.senv must be caught:\n{}", r.stderr);
-    assert!(r.stderr.contains("prod.senv"), "must name prod.senv:\n{}", r.stderr);
+    assert!(
+        r.stderr.contains("prod.senv"),
+        "must name prod.senv:\n{}",
+        r.stderr
+    );
     // The real store must never appear as a finding line.
     assert!(
         !r.stderr.contains("  .senv:"),
@@ -162,7 +186,8 @@ fn short_secret_floor_is_visible() {
     // The real secret is still caught.
     assert_eq!(r.code, 1, "real secret must be caught:\n{}", r.stderr);
     assert!(
-        r.stderr.contains("not scanning for 1 secret(s) under 8 bytes: SHORT"),
+        r.stderr
+            .contains("not scanning for 1 secret(s) under 8 bytes: SHORT"),
         "must note the skipped short key:\n{}",
         r.stderr
     );
@@ -192,7 +217,7 @@ fn unreadable_file_warns() {
     let path = fx.path("secret.txt");
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
     let r = fx.s(&["scan"]); // worktree scan reads the file
-    // Restore perms so the temp dir can be cleaned up.
+                             // Restore perms so the temp dir can be cleaned up.
     let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644));
 
     assert!(
@@ -252,7 +277,10 @@ fn append_guard_before_exit_zero() {
         guard < exit,
         "guard must appear before `exit 0`:\n{content}"
     );
-    assert!(is_exec(&fx.path(".git/hooks/pre-commit")), "must be executable");
+    assert!(
+        is_exec(&fx.path(".git/hooks/pre-commit")),
+        "must be executable"
+    );
 }
 
 /// `check_hook` warns when the only `s scan` occurrence is inside a comment —
