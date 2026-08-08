@@ -2160,7 +2160,7 @@ mod pty {
                         }
                     }
                     // fd 0 is now the slave — acquire it as controlling terminal.
-                    libc::ioctl(0, libc::TIOCSCTTY, 0 as libc::c_int);
+                    libc::ioctl(0, libc::TIOCSCTTY as libc::c_ulong, 0 as libc::c_int);
                     if sfd > 2 {
                         libc::close(sfd);
                     }
