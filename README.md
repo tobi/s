@@ -182,6 +182,9 @@ gh release download -R tobi/s -p '*-x86_64-unknown-linux-musl.tar.gz' -O - \
   | tar xz -C ~/.local/bin
 ```
 
+Release artifacts carry SLSA build provenance. mise verifies it automatically;
+by hand: `gh attestation verify <file> --repo tobi/s`.
+
 ## Nix home-manager
 
 ```nix
