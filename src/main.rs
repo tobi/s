@@ -213,6 +213,7 @@ fn run() -> Result<()> {
         "configure" | "config" => cmd_configure(&args[1..]),
         "get" => cmd_get(&args[1..]),
         "rm" => cmd_rm(&args[1..]),
+        "rename" | "mv" => cmd_rename(&args[1..]),
         "list" | "ls" => cmd_list(&args[1..]),
         "import" => cmd_import(&args[1..]),
         "export" => cmd_export(&args[1..]),
@@ -260,6 +261,7 @@ secrets:
                                 remove the domain's configured headers
   s get <NAME>                  show decrypted value (human debugging)
   s rm <NAME>                   delete a secret
+  s rename <OLD> <NEW>          rename a secret and its configured references
   s list                        list secrets (values masked)
 
 HTTP:
@@ -1131,6 +1133,105 @@ fn cmd_rm(args: &[String]) -> Result<()> {
     file.keys.remove(key);
     file.save(&path)?;
     success!("removed {key}");
+    Ok(())
+}
+
+fn rename_placeholder_references(input: &str, old: &str, new: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = String::with_capacity(input.len());
+    let mut copied = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'$' {
+            i += 1;
+            continue;
+        }
+        let (start, end, token_end, braced) = if bytes.get(i + 1) == Some(&b'{') {
+            let start = i + 2;
+            let Some(rel_end) = input[start..].find('}') else {
+                i += 1;
+                continue;
+            };
+            let end = start + rel_end;
+            (start, end, end + 1, true)
+        } else {
+            let start = i + 1;
+            let mut end = start;
+            while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
+                end += 1;
+            }
+            (start, end, end, false)
+        };
+        if &input[start..end] == old {
+            out.push_str(&input[copied..i]);
+            out.push('$');
+            if braced {
+                out.push('{');
+            }
+            out.push_str(new);
+            if braced {
+                out.push('}');
+            }
+            copied = token_end;
+        }
+        i = token_end.max(i + 1);
+    }
+    out.push_str(&input[copied..]);
+    out
+}
+
+fn cmd_rename(args: &[String]) -> Result<()> {
+    if args.len() != 2 {
+        bail!("usage: s rename <OLD> <NEW>");
+    }
+    let old = &args[0];
+    let new = &args[1];
+    for name in [old, new] {
+        if !store::valid_key_name(name) {
+            bail!("invalid key: {name:?}");
+        }
+        if is_unsafe_env_name(name) {
+            bail!("unsafe env name: {name} — cannot use it in the store");
+        }
+    }
+    if old == new {
+        bail!("old and new names are identical");
+    }
+
+    let source_path = store_containing(old)?.ok_or_else(|| anyhow!("key {old} not found"))?;
+    if store_containing(new)?.is_some() {
+        bail!("key {new} already exists");
+    }
+    let pw = get_password()?;
+
+    let paths = read_store_paths();
+    let mut files = Vec::with_capacity(paths.len());
+    for path in paths {
+        files.push((path.clone(), store::SenvFile::load(&path)?));
+    }
+    let source = files
+        .iter_mut()
+        .find(|(path, _)| *path == source_path)
+        .context("source store disappeared")?;
+    let mut entry = source
+        .1
+        .keys
+        .remove(old)
+        .context("source key disappeared")?;
+    entry.rename(&pw, old, new)?;
+    source.1.keys.insert(new.clone(), entry);
+
+    for (_, file) in &mut files {
+        for policy in file.domains.values_mut() {
+            for template in policy.headers.values_mut() {
+                *template = rename_placeholder_references(template, old, new);
+            }
+        }
+    }
+    for (path, file) in files {
+        file.save(&path)?;
+    }
+    success!("renamed {old} to {new}");
     Ok(())
 }
 

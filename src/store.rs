@@ -158,6 +158,27 @@ impl KeyEntry {
         };
         Ok(())
     }
+
+    /// Re-encrypt the current value and every history entry under a new key
+    /// name. V2 blobs authenticate their key name as AAD, so moving the map
+    /// entry without this rewrite would make it undecryptable.
+    pub fn rename(&mut self, password: &str, old_name: &str, new_name: &str) -> Result<()> {
+        let mut renamed = self.clone();
+        match &mut renamed {
+            KeyEntry::Simple(value) => {
+                *value = reencrypt_value_with_key_name(value, password, old_name, new_name)?;
+            }
+            KeyEntry::Detailed { value, history, .. } => {
+                *value = reencrypt_value_with_key_name(value, password, old_name, new_name)?;
+                for entry in history {
+                    entry.blob =
+                        reencrypt_value_with_key_name(&entry.blob, password, old_name, new_name)?;
+                }
+            }
+        }
+        *self = renamed;
+        Ok(())
+    }
 }
 
 /// Re-encrypt legacy history blobs, dropping any that will not decrypt.
@@ -316,6 +337,16 @@ pub fn decrypt_value(blob: &str, password: &str, key_name: &str) -> Result<Strin
 pub fn reencrypt_value(blob: &str, password: &str, key_name: &str) -> Result<String> {
     let pt = Zeroizing::new(decrypt_value(blob, password, key_name)?);
     encrypt_value(&pt, password, key_name)
+}
+
+fn reencrypt_value_with_key_name(
+    blob: &str,
+    password: &str,
+    old_name: &str,
+    new_name: &str,
+) -> Result<String> {
+    let pt = Zeroizing::new(decrypt_value(blob, password, old_name)?);
+    encrypt_value(&pt, password, new_name)
 }
 
 /// True for a blob written before the versioned format, i.e. one that should be

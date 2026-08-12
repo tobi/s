@@ -77,6 +77,65 @@ fn add_is_an_alias_for_set() {
     assert!(f.s(&["list"]).stdout.contains("ALIAS"));
 }
 
+#[test]
+fn get_dispatches_to_tty_guard() {
+    let f = Fixture::inited();
+    let r = f.s(&["get", "KEY"]);
+    r.fails();
+    assert!(r.stderr.contains("refusing to show secret without a TTY"));
+}
+
+#[test]
+fn rename_reencrypts_value_and_updates_configured_references() {
+    let f = Fixture::inited();
+    f.set("OLD_KEY", "first");
+    f.set("OLD_KEY", "second");
+    f.s(&[
+        "configure",
+        "api.example.test",
+        "--header",
+        "Authorization: Bearer $OLD_KEY",
+        "--header",
+        "X-Backup: ${OLD_KEY}",
+    ])
+    .ok();
+
+    let r = f.s(&["rename", "OLD_KEY", "NEW_KEY"]);
+    r.ok();
+    let listed = f.s(&["list"]).stdout;
+    assert!(listed.contains("NEW_KEY"));
+    assert!(!listed.contains("OLD_KEY"));
+
+    let out = f.path("renamed");
+    let out_str = out.to_str().unwrap();
+    f.s(&[
+        "NEW_KEY",
+        "--",
+        "sh",
+        "-c",
+        &format!("printf %s \"$NEW_KEY\" > {out_str}"),
+    ])
+    .ok();
+    assert_eq!(f.read_str("renamed"), "second");
+
+    f.s(&["rollback", "NEW_KEY", "--to", "1"]).ok();
+    f.s(&[
+        "NEW_KEY",
+        "--",
+        "sh",
+        "-c",
+        &format!("printf %s \"$NEW_KEY\" >> {out_str}"),
+    ])
+    .ok();
+    assert_eq!(f.read_str("renamed"), "secondfirst");
+
+    let store = f.read_str(".senv");
+    assert!(store.contains("$NEW_KEY"));
+    assert!(store.contains("${NEW_KEY}"));
+    assert!(!store.contains("$OLD_KEY"));
+    assert!(!store.contains("${OLD_KEY}"));
+}
+
 #[cfg(unix)]
 #[test]
 fn interactive_set_accepts_bracketed_multiline_paste() {
