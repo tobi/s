@@ -291,6 +291,12 @@ impl Fixture {
     /// writes to `/dev/tty` bypasses ordinary pipes entirely.
     #[cfg(unix)]
     pub fn s_pty(&self, args: &[&str]) -> PtyRun {
+        self.s_pty_input(args, &[])
+    }
+
+    /// Run `s` on a PTY and write bytes to its terminal input.
+    #[cfg(unix)]
+    pub fn s_pty_input(&self, args: &[&str], input: &[u8]) -> PtyRun {
         use std::os::fd::FromRawFd;
         use std::os::unix::process::CommandExt;
 
@@ -326,6 +332,9 @@ impl Fixture {
 
         let mut out = Vec::new();
         let mut m = unsafe { std::fs::File::from_raw_fd(master) };
+        if !input.is_empty() {
+            m.write_all(input).expect("write PTY input");
+        }
         let mut buf = [0u8; 4096];
         loop {
             match m.read(&mut buf) {

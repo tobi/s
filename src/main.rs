@@ -15,6 +15,7 @@
 mod scrub;
 mod store;
 
+use std::fmt;
 use std::io::{self, BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -100,11 +101,57 @@ elsewhere.
 
 fn main() {
     if let Err(e) = run() {
-        eprintln!("s: {e:#}");
+        emit_error(format_args!("{e:#}"));
         std::process::exit(1);
     }
 }
 
+const ANSI_RESET: &str = "\x1b[0m";
+const ANSI_GREEN: &str = "\x1b[32m";
+const ANSI_YELLOW: &str = "\x1b[33m";
+const ANSI_RED: &str = "\x1b[31m";
+const ANSI_DIM: &str = "\x1b[2m";
+
+/// Status output is for people, so keep it on stderr and make it readable in
+/// both terminals and logs. NO_COLOR follows no-color.org: a non-empty value
+/// disables ANSI styling; non-TTY output is unstyled too.
+fn colors_enabled() -> bool {
+    !std::env::var("NO_COLOR")
+        .map(|value| !value.is_empty())
+        .unwrap_or(false)
+        && is_stderr_tty()
+}
+
+fn is_stderr_tty() -> bool {
+    use std::os::fd::AsRawFd;
+    unsafe { libc::isatty(io::stderr().as_raw_fd()) == 1 }
+}
+
+fn emit_status(symbol: &str, color: &str, message: fmt::Arguments<'_>) {
+    if colors_enabled() {
+        eprintln!("{color}{symbol}{ANSI_RESET} {message}");
+    } else {
+        eprintln!("{symbol} {message}");
+    }
+}
+
+fn emit_error(message: fmt::Arguments<'_>) {
+    if colors_enabled() {
+        eprintln!("{ANSI_RED}error:{ANSI_RESET} {message}");
+    } else {
+        eprintln!("error: {message}");
+    }
+}
+
+macro_rules! success {
+    ($($arg:tt)*) => { emit_status("✓", ANSI_GREEN, format_args!($($arg)*)) };
+}
+macro_rules! info {
+    ($($arg:tt)*) => { emit_status("·", ANSI_DIM, format_args!($($arg)*)) };
+}
+macro_rules! warning {
+    ($($arg:tt)*) => { emit_status("!", ANSI_YELLOW, format_args!($($arg)*)) };
+}
 fn run() -> Result<()> {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     expand_inline_shebang_args(&mut args);
@@ -157,7 +204,7 @@ fn run() -> Result<()> {
     // No `--`: subcommand matching only.
     match args[0].as_str() {
         "init" => cmd_init(&args[1..]),
-        "set" => cmd_set(&args[1..]),
+        "set" | "add" => cmd_set(&args[1..]),
         "configure" | "config" => cmd_configure(&args[1..]),
         "get" => cmd_get(&args[1..]),
         "rm" => cmd_rm(&args[1..]),
@@ -599,7 +646,7 @@ fn cmd_init(args: &[String]) -> Result<()> {
     }
     let file = store::SenvFile::default();
     file.save(&path)?;
-    eprintln!("s: created {}", path.display());
+    success!("created {}", path.display());
 
     // Hook and .gitignore installation apply when the resolved path is the
     // project-local .senv, including an absolute S_FILE pointing at it. A
@@ -680,7 +727,7 @@ fn install_hook() -> Result<()> {
     let hooks_dir = match resolve_hooks_dir() {
         Some(d) => d,
         None => {
-            eprintln!("s: not a git repo, skipping hook install");
+            info!("not a Git repository; skipped pre-commit hook");
             return Ok(());
         }
     };
@@ -690,20 +737,20 @@ fn install_hook() -> Result<()> {
     if hook_path.exists() {
         let content = std::fs::read_to_string(&hook_path).unwrap_or_default();
         if has_scan_guard(&content) {
-            eprintln!("s: pre-commit hook already has scan guard");
+            info!("pre-commit hook already has a secret scan guard");
             return Ok(());
         }
         std::fs::write(&hook_path, insert_guard_after_shebang(&content, scan_line))
             .context("writing pre-commit hook")?;
         ensure_executable(&hook_path)?;
-        eprintln!("s: appended scan guard to existing pre-commit hook");
+        success!("updated existing pre-commit hook with a secret scan");
     } else {
         std::fs::create_dir_all(&hooks_dir)
             .with_context(|| format!("creating {}", hooks_dir.display()))?;
         let content = format!("#!/bin/sh\n# s: guard against committing secrets\n{scan_line}\n");
         std::fs::write(&hook_path, &content).context("writing pre-commit hook")?;
         ensure_executable(&hook_path)?;
-        eprintln!("s: installed pre-commit hook");
+        success!("installed pre-commit hook with a secret scan");
     }
     Ok(())
 }
@@ -737,10 +784,10 @@ fn ensure_gitignore() -> Result<()> {
         f.write_all(block.as_bytes())
             .context("writing .gitignore")?;
     }
-    eprintln!("s: ignored .senv by default");
-    eprintln!(
-        "s: the encrypted store may be committed if its encryption key stays private; \
-         remove the ignore or create it with `s init --git`"
+    success!("ignored .senv by default");
+    info!(
+        "the encrypted store may be committed if its encryption key stays private; \
+          remove the ignore or create it with `s init --git`"
     );
     Ok(())
 }
@@ -762,8 +809,8 @@ fn allow_git_tracking() -> Result<()> {
         }
         std::fs::write(&gi, filtered).context("writing .gitignore")?;
     }
-    eprintln!("s: .senv is eligible for Git tracking (--git)");
-    eprintln!("s: keep its encryption key private; never commit or share the key");
+    success!(".senv is eligible for Git tracking (--git)");
+    warning!("keep its encryption key private; never commit or share the key");
     Ok(())
 }
 
@@ -783,10 +830,10 @@ fn check_hook() {
     }
     let content = std::fs::read_to_string(&hook).unwrap_or_default();
     if !has_scan_guard(&content) {
-        eprintln!("s: ⚠ pre-commit hook exists but has no `s scan` guard. run `s init` to fix.");
+        warning!("pre-commit hook has no `s scan` guard; run `s init` to fix");
     }
     if !is_executable(&hook) {
-        eprintln!("s: ⚠ pre-commit hook is not executable. run `s init` to fix.");
+        warning!("pre-commit hook is not executable; run `s init` to fix");
     }
 }
 
@@ -850,6 +897,12 @@ fn read_secret_interactive(key: &str) -> Result<String> {
     write!(tty_w, "{key}: ")?;
     tty_w.flush()?;
 
+    // Ask the terminal to wrap clipboard input in bracketed-paste markers.
+    // Without this, a pasted newline is indistinguishable from the Enter key
+    // that submits a one-line value.
+    write!(tty_w, "\x1b[?2004h")?;
+    tty_w.flush()?;
+
     let fd = {
         use std::os::fd::AsRawFd;
         tty.as_raw_fd()
@@ -874,6 +927,8 @@ fn read_secret_interactive(key: &str) -> Result<String> {
     // don't echo until the character completes.
     let mut bytes: Vec<u8> = Vec::new();
     let mut stars: usize = 0;
+    let mut in_paste = false;
+    let mut marker = Vec::new();
     let read_result: Result<()> = (|| {
         let mut reader = BufReader::new(&tty);
         let mut buf = [0u8; 1];
@@ -881,43 +936,75 @@ fn read_secret_interactive(key: &str) -> Result<String> {
             if reader.read(&mut buf)? == 0 {
                 break;
             }
-            match buf[0] {
-                b'\n' | b'\r' => break,
-                127 | 8 => {
-                    // backspace / delete — drop a whole UTF-8 char
-                    if !bytes.is_empty() {
-                        let mut start = bytes.len() - 1;
-                        while start > 0 && (bytes[start] & 0xC0) == 0x80 {
-                            start -= 1;
-                        }
-                        bytes.truncate(start);
-                        let _ = write!(tty_w, "\x08 \x08");
-                        let _ = tty_w.flush();
-                        if stars > 0 {
-                            stars -= 1;
-                        }
+            let c = buf[0];
+
+            // Bracketed-paste markers are terminal control sequences, not
+            // part of the value. Newlines are data only between the markers;
+            // an ordinary Enter still submits the value.
+            if c == 0x1b && marker.is_empty() {
+                marker.push(c);
+                continue;
+            }
+            if !marker.is_empty() {
+                marker.push(c);
+                let expected = if in_paste {
+                    b"\x1b[201~".as_slice()
+                } else {
+                    b"\x1b[200~".as_slice()
+                };
+                if expected.starts_with(&marker) {
+                    if marker == expected {
+                        in_paste = !in_paste;
+                        marker.clear();
+                    }
+                    continue;
+                }
+                marker.clear();
+                continue;
+            }
+
+            if !in_paste && matches!(c, b'\n' | b'\r') {
+                break;
+            }
+            if !in_paste && matches!(c, 127 | 8) {
+                // backspace / delete — drop a whole UTF-8 char
+                if !bytes.is_empty() {
+                    let mut start = bytes.len() - 1;
+                    while start > 0 && (bytes[start] & 0xC0) == 0x80 {
+                        start -= 1;
+                    }
+                    bytes.truncate(start);
+                    let _ = write!(tty_w, "\x08 \x08");
+                    let _ = tty_w.flush();
+                    if stars > 0 {
+                        stars -= 1;
                     }
                 }
-                3 => bail!("aborted"), // Ctrl-C
-                c if c >= 32 => {
-                    bytes.push(c);
-                    if let Ok(s) = std::str::from_utf8(&bytes) {
-                        let chars = s.chars().count();
-                        while stars < chars {
-                            let _ = write!(tty_w, "*");
-                            stars += 1;
-                        }
-                        let _ = tty_w.flush();
-                    }
+                continue;
+            }
+            if !in_paste && c == 3 {
+                bail!("aborted"); // Ctrl-C
+            }
+            if in_paste && c < 32 && c != b'\n' && c != b'\r' {
+                continue;
+            }
+            bytes.push(c);
+            if let Ok(s) = std::str::from_utf8(&bytes) {
+                let chars = s.chars().filter(|&c| c != '\n' && c != '\r').count();
+                while stars < chars {
+                    let _ = write!(tty_w, "*");
+                    stars += 1;
                 }
-                _ => {} // ignore other control chars
+                let _ = tty_w.flush();
             }
         }
         Ok(())
     })();
 
-    // Always restore the terminal, even on error / Ctrl-C / early return —
-    // an error between tcsetattr(raw) and this line left the user without echo.
+    // Disable bracketed paste even when reading failed, so the user's shell
+    // does not remain in paste mode.
+    let _ = write!(tty_w, "\x1b[?2004l");
+    let _ = tty_w.flush();
     unsafe { libc::tcsetattr(fd, libc::TCSANOW, &orig) };
     let _ = writeln!(tty_w);
 
@@ -952,7 +1039,7 @@ fn set_key_value(key: &str, value: &str, force: bool) -> Result<()> {
     file.set_key(key, blob, &pw)?;
 
     file.save(&path)?;
-    eprintln!("s: {verb} {key}");
+    success!("{verb} {key}");
     Ok(())
 }
 fn cmd_configure(args: &[String]) -> Result<()> {
@@ -1004,7 +1091,7 @@ fn cmd_configure(args: &[String]) -> Result<()> {
             .extend(headers);
     }
     file.save(&path)?;
-    eprintln!("s: configured {domain}");
+    success!("configured {domain}");
     Ok(())
 }
 
@@ -1038,7 +1125,7 @@ fn cmd_rm(args: &[String]) -> Result<()> {
     let mut file = store::SenvFile::load(&path)?;
     file.keys.remove(key);
     file.save(&path)?;
-    eprintln!("s: removed {key}");
+    success!("removed {key}");
     Ok(())
 }
 
@@ -1059,7 +1146,7 @@ fn cmd_list(args: &[String]) -> Result<()> {
         if json {
             println!("[]")
         } else {
-            eprintln!("s: no {STORE_FILE} here")
+            info!("no {STORE_FILE} here")
         }
         return Ok(());
     }
@@ -1068,7 +1155,7 @@ fn cmd_list(args: &[String]) -> Result<()> {
         if json {
             println!("[]")
         } else {
-            eprintln!("s: (no secrets)")
+            info!("no secrets")
         }
         return Ok(());
     }
@@ -1911,7 +1998,7 @@ fn run_scrubbed(
 fn setup_child_env(cmd: &mut Command, entries: &[(String, String)]) {
     for (k, v) in entries {
         if is_unsafe_env_name(k) {
-            eprintln!("s: refusing to inject {k} (unsafe variable name)");
+            warning!("refusing to inject {k} (unsafe variable name)");
             continue;
         }
         cmd.env(k, v);
@@ -2305,7 +2392,7 @@ fn cmd_import(args: &[String]) -> Result<()> {
     };
 
     if pairs.is_empty() {
-        eprintln!("s: nothing to import");
+        info!("nothing to import");
         return Ok(());
     }
 
@@ -2332,7 +2419,7 @@ fn cmd_import(args: &[String]) -> Result<()> {
         let mut count = 0;
         for (k, v) in items {
             if file.keys.contains_key(&k) && !force && path == primary {
-                eprintln!("s: skipping {k} (exists, use -f to overwrite)");
+                warning!("skipping {k} (exists; use -f to overwrite)");
                 continue;
             }
             let blob = store::encrypt_value(&v, &pw, &k)?;
@@ -2342,7 +2429,7 @@ fn cmd_import(args: &[String]) -> Result<()> {
         file.save(&path)?;
         total += count;
     }
-    eprintln!("s: imported {total} secret(s)");
+    success!("imported {total} secret(s)");
     Ok(())
 }
 
@@ -2478,7 +2565,7 @@ fn cmd_export(args: &[String]) -> Result<()> {
         // Plaintext on disk — restrict to owner read/write.
         store::write_private(Path::new(&f), output.as_bytes())
             .with_context(|| format!("writing {f}"))?;
-        eprintln!("s: exported {} secret(s) to {f}", entries.len());
+        success!("exported {} secret(s) to {f}", entries.len());
     } else {
         print!("{output}");
     }
@@ -2544,7 +2631,7 @@ fn cmd_rollback(args: &[String]) -> Result<()> {
         .ok_or_else(|| anyhow!("key {key} not found"))?;
     entry.rollback(n, &pw, &key)?;
     file.save(&path)?;
-    eprintln!("s: rolled back {key} to v{n}");
+    success!("rolled back {key} to v{n}");
     Ok(())
 }
 
@@ -2594,21 +2681,21 @@ fn cmd_scan(args: &[String]) -> Result<()> {
         }
     }
     if !too_short.is_empty() {
-        eprintln!(
-            "s: note: not scanning for {} secret(s) under 8 bytes: {}",
+        info!(
+            "not scanning for {} secret(s) under 8 bytes: {}",
             too_short.len(),
             too_short.join(", ")
         );
     }
 
     if secrets.is_empty() {
-        eprintln!("s: no secrets to scan for");
+        info!("no secrets to scan for");
         return Ok(());
     }
 
     let paths = collect_scan_paths(staged, scan_path.as_deref())?;
     if paths.is_empty() {
-        eprintln!("s: no files to scan");
+        info!("no files to scan");
         return Ok(());
     }
 
@@ -2661,7 +2748,7 @@ fn cmd_scan(args: &[String]) -> Result<()> {
 
     // Report unreadable files rather than silently dropping them.
     for (p, e) in &unreadable {
-        eprintln!("s: warning: could not read {p}: {e}");
+        warning!("could not read {p}: {e}");
     }
 
     if found.is_empty() {
@@ -2669,18 +2756,19 @@ fn cmd_scan(args: &[String]) -> Result<()> {
         return Ok(());
     }
 
-    eprintln!("✗ secrets found in files:\n");
+    emit_error(format_args!("secrets found in files:"));
+    eprintln!();
     for (f, line, key) in &found {
         eprintln!("  {f}:{line}");
         eprintln!("    contains: {key}\n");
     }
     let unique: std::collections::HashSet<&str> =
         found.iter().map(|(f, _, _)| f.as_str()).collect();
-    eprintln!(
+    emit_error(format_args!(
         "found {} secret(s) in {} file(s)",
         found.len(),
         unique.len()
-    );
+    ));
     std::process::exit(1);
 }
 
@@ -2786,7 +2874,7 @@ fn confirm_overwrite(key: &str) -> Result<bool> {
     {
         Ok(f) => f,
         Err(_) => {
-            eprintln!("s: key {key} already exists; pass -f to overwrite");
+            warning!("key {key} already exists; pass -f to overwrite");
             return Ok(false);
         }
     };

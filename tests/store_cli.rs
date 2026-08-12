@@ -70,6 +70,53 @@ fn init_git_flag_makes_store_trackable() {
 // --- Defect 3: set and exec disagree on key names ---------------------------
 
 #[test]
+fn add_is_an_alias_for_set() {
+    let f = Fixture::inited();
+    let r = f.s_stdin(&["add", "ALIAS", "--stdin"], "hello");
+    r.ok();
+    assert!(f.s(&["list"]).stdout.contains("ALIAS"));
+}
+
+#[cfg(unix)]
+#[test]
+fn interactive_set_accepts_bracketed_multiline_paste() {
+    let f = Fixture::inited();
+    let pasted = b"\x1b[200~first line\nsecond line\x1b[201~\n";
+    let r = f.s_pty_input(&["set", "PEM_KEY"], pasted);
+    assert_eq!(r.code, 0, "interactive set failed: {}", r.output);
+
+    let out = f.path("pasted");
+    let out_str = out.to_str().unwrap();
+    let r = f.s(&[
+        "PEM_KEY",
+        "--",
+        "sh",
+        "-c",
+        &format!("printf %s \"$PEM_KEY\" > {out_str}"),
+    ]);
+    r.ok();
+    assert_eq!(f.read_str("pasted"), "first line\nsecond line");
+
+    let r = f.s_pty_input(
+        &["add", "PEM_ADD"],
+        b"\x1b[200~add first\nadd second\x1b[201~\n",
+    );
+    assert_eq!(r.code, 0, "interactive add failed: {}", r.output);
+    let r = f.s(&[
+        "PEM_ADD",
+        "--",
+        "sh",
+        "-c",
+        &format!("printf %s \"$PEM_ADD\" >> {out_str}"),
+    ]);
+    r.ok();
+    assert_eq!(
+        f.read_str("pasted"),
+        "first line\nsecond lineadd first\nadd second"
+    );
+}
+
+#[test]
 fn lower_case_key_exec() {
     let f = Fixture::inited();
     f.s_stdin(&["set", "lower_key", "--stdin"], "hello").ok();
