@@ -165,6 +165,11 @@ fn run() -> Result<()> {
         return Ok(());
     }
 
+    if args.len() == 1 && matches!(args[0].as_str(), "-v" | "--version") {
+        println!("{}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
     // Verify git hook exists (if in a git repo with .senv)
     check_hook();
 

@@ -1,6 +1,6 @@
 [package]
 name = "s"
-version = "0.9.3"
+version = "0.9.4"
 edition = "2021"
 description = "Encrypted env store — agents use secrets without seeing them"
 license = "MIT"

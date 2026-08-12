@@ -217,6 +217,16 @@ fn empty_and_help_output_prioritize_agents_and_humans() {
         assert!(run.stderr.contains("s get <NAME>"));
     }
 }
+
+#[test]
+fn version_flag_prints_package_version() {
+    let f = Fixture::new();
+    for flag in ["-v", "--version"] {
+        let r = f.s(&[flag]);
+        r.ok();
+        assert_eq!(r.stdout.trim(), env!("CARGO_PKG_VERSION"));
+    }
+}
 #[test]
 fn set_rejects_unsafe_env_name() {
     let f = Fixture::inited();
