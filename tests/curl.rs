@@ -339,7 +339,7 @@ fn one_key_can_use_different_headers_for_different_domains() {
 }
 
 #[test]
-fn local_and_global_headers_merge_with_local_precedence() {
+fn global_store_headers_are_ignored() {
     let f = Fixture::new();
     let global = f.path(".config/senv/senv");
     let global_str = global.to_str().unwrap();
@@ -380,7 +380,7 @@ fn local_and_global_headers_merge_with_local_precedence() {
         None,
     );
     run.ok();
-    assert!(run.stdout.contains("Authorization: Bearer [REDACTED]"));
+    assert!(!run.stdout.contains("Authorization"));
     assert!(run.stdout.contains("X-Scope: local"));
     assert!(!run.stdout.contains("X-Scope: global"));
 }

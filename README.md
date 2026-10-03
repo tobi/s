@@ -171,20 +171,13 @@ Checks actual secret values — no regex, no false positives.
 
 ## Store location
 
-`s` resolves which `.senv` to use in this order:
+`s` is local-only: it uses `./.senv` in the current directory. There is no
+global store and no fallback to `~/.config`. Without a `.senv` in the current
+directory, `s` asks you to run `s init`.
 
-1. `S_FILE` env var — explicit path override (used for reads and writes)
-2. `./.senv` — project-local store in the current directory
-3. `~/.config/senv/senv` — global store (honours `$XDG_CONFIG_HOME`)
-
-When both a local and a global store exist, reads **merge** them with the local
-store winning on conflicts — so a repo can override or extend your global
-secrets. A single password (from `S_KEY` or one prompt) decrypts both. Setting
-`S_FILE` bypasses the merge and uses only that file.
-
-Writes update a key wherever it already lives; brand-new keys are created in the
-highest-precedence existing store. `s init` creates `./.senv` by default, or the
-`S_FILE` path if set (e.g. `S_FILE=~/.config/senv/senv s init` for a global store).
+To point at a specific store explicitly (for example, a service that runs
+from another directory), set `S_FILE` to its path. `S_FILE` replaces `./.senv`
+for reads, writes and `s init`.
 
 ## Password
 

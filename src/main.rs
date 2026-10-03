@@ -288,10 +288,9 @@ setup:
   s init                        create .senv, ignore it, install pre-commit hook
   s init --git                  create .senv eligible for Git tracking
 
-store location (precedence):
-  S_FILE env var                explicit store path (overrides the rest)
-  ./.senv                       project-local store
-  ~/.config/senv/senv           global store (merged under local; local wins)
+store location:
+  ./.senv                       project-local store (the only store)
+  S_FILE env var                explicit store path (overrides ./.senv)
 
 password (one of):
   S_KEY env var                 the password directly
@@ -353,69 +352,36 @@ fn override_store_path() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-/// Global fallthrough store: `~/.config/senv/senv` (honours `$XDG_CONFIG_HOME`).
-fn global_store_path() -> Option<PathBuf> {
-    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
-        return Some(PathBuf::from(xdg).join("senv/senv"));
-    }
-    std::env::var_os("HOME")
-        .filter(|v| !v.is_empty())
-        .map(|h| PathBuf::from(h).join(".config/senv/senv"))
-}
-
 /// Where `s init` should create the store: `$S_FILE` if set, else local `.senv`.
 fn store_path_for_init() -> PathBuf {
     override_store_path().unwrap_or_else(store_path)
 }
 
-/// Stores to read from, highest precedence first. With `$S_FILE` set, that
-/// file is the *only* store (an explicit override — no global merge).
-/// Otherwise reads merge `./.senv` over `~/.config/senv/senv`, local winning.
+/// The store to read from, if it exists. There is exactly one store: `$S_FILE`
+/// when set, otherwise the project-local `./.senv`. There is no global
+/// fallback — secrets only ever come from the local context.
 fn read_store_paths() -> Vec<PathBuf> {
-    if let Some(p) = override_store_path() {
-        return if p.exists() { vec![p] } else { Vec::new() };
+    let p = store_path();
+    if p.exists() {
+        vec![p]
+    } else {
+        Vec::new()
     }
-    let mut paths = Vec::new();
-    let local = store_path();
-    if local.exists() {
-        paths.push(local);
-    }
-    if let Some(g) = global_store_path() {
-        if g.exists() {
-            paths.push(g);
-        }
-    }
-    paths
 }
 
-/// The single store that writes target / the existence guard for reads.
-/// Precedence: `$S_FILE` (explicit override), then `./.senv`, then
-/// `~/.config/senv/senv`; first existing wins. New keys land here, while
-/// existing keys are updated wherever they already live (see `store_containing`).
+/// The store that writes target / the existence guard for reads.
 fn ensure_store() -> Result<PathBuf> {
-    if let Some(p) = override_store_path() {
-        if p.exists() {
-            return Ok(p);
-        }
+    let p = store_path();
+    if p.exists() {
+        return Ok(p);
+    }
+    if override_store_path().is_some() {
         bail!("S_FILE={} does not exist — run `s init` first", p.display());
-    }
-    let local = store_path();
-    if local.exists() {
-        return Ok(local);
-    }
-    if let Some(g) = global_store_path() {
-        if g.exists() {
-            return Ok(g);
-        }
-        bail!(
-            "no {STORE_FILE} here and no global store at {} — run `s init` first",
-            g.display()
-        );
     }
     bail!("no {STORE_FILE} here — run `s init` first");
 }
 
-/// Find which store currently holds `key`, searching in read precedence order.
+/// The store path if it currently holds `key`.
 fn store_containing(key: &str) -> Result<Option<PathBuf>> {
     for p in read_store_paths() {
         let f = store::SenvFile::load(&p)?;
@@ -426,8 +392,8 @@ fn store_containing(key: &str) -> Result<Option<PathBuf>> {
     Ok(None)
 }
 
-/// Merge every readable store, local (higher precedence) winning independently
-/// for each key and configured header.
+/// Load the store, or an empty one if `./.senv` does not exist yet. A missing
+/// explicit `$S_FILE` is an error.
 fn merged_store() -> Result<store::SenvFile> {
     if let Some(path) = override_store_path() {
         if !path.exists() {
@@ -437,21 +403,10 @@ fn merged_store() -> Result<store::SenvFile> {
             );
         }
     }
-    let mut merged = store::SenvFile::default();
-    // Apply lowest precedence first so higher-precedence values overwrite.
-    for path in read_store_paths().iter().rev() {
-        let file = store::SenvFile::load(path)?;
-        merged.keys.extend(file.keys);
-        for (domain, policy) in file.domains {
-            merged
-                .domains
-                .entry(domain)
-                .or_default()
-                .headers
-                .extend(policy.headers);
-        }
+    match read_store_paths().first() {
+        Some(path) => store::SenvFile::load(path),
+        None => Ok(store::SenvFile::default()),
     }
-    Ok(merged)
 }
 
 fn merged_keys() -> Result<std::collections::BTreeMap<String, store::KeyEntry>> {
@@ -657,7 +612,7 @@ fn cmd_init(args: &[String]) -> Result<()> {
 
     // Hook and .gitignore installation apply when the resolved path is the
     // project-local .senv, including an absolute S_FILE pointing at it. A
-    // genuinely external S_FILE (for example a global store) must not mutate
+    // genuinely external S_FILE (a store elsewhere on disk) must not mutate
     // the current repository.
     let is_local = path == PathBuf::from(STORE_FILE)
         || std::fs::canonicalize(&path).ok() == std::fs::canonicalize(STORE_FILE).ok();
@@ -935,7 +890,7 @@ fn read_secret_interactive(key: &str) -> Result<String> {
     let mut bytes: Vec<u8> = Vec::new();
     let mut stars: usize = 0;
     let mut in_paste = false;
-    let mut marker = Vec::new();
+    let mut esc: Vec<u8> = Vec::new();
     let read_result: Result<()> = (|| {
         let mut reader = BufReader::new(&tty);
         let mut buf = [0u8; 1];
@@ -943,31 +898,40 @@ fn read_secret_interactive(key: &str) -> Result<String> {
             if reader.read(&mut buf)? == 0 {
                 break;
             }
-            let c = buf[0];
+            let mut c = buf[0];
 
-            // Bracketed-paste markers are terminal control sequences, not
-            // part of the value. Newlines are data only between the markers;
-            // an ordinary Enter still submits the value.
-            if c == 0x1b && marker.is_empty() {
-                marker.push(c);
+            // Escape sequences (bracketed-paste markers, arrow keys, and
+            // Enter/Backspace as encoded by the kitty keyboard protocol or
+            // xterm modifyOtherKeys) are never part of the value. Collect a
+            // whole sequence before acting, so no stray bytes leak into it.
+            if c == 0x1b && esc.is_empty() {
+                esc.push(c);
                 continue;
             }
-            if !marker.is_empty() {
-                marker.push(c);
-                let expected = if in_paste {
-                    b"\x1b[201~".as_slice()
-                } else {
-                    b"\x1b[200~".as_slice()
+            if !esc.is_empty() {
+                esc.push(c);
+                let Some(key) = decode_escape(&esc) else {
+                    continue; // incomplete sequence
                 };
-                if expected.starts_with(&marker) {
-                    if marker == expected {
-                        in_paste = !in_paste;
-                        marker.clear();
+                esc.clear();
+                match key {
+                    EscKey::PasteStart => in_paste = true,
+                    EscKey::PasteEnd => in_paste = false,
+                    EscKey::Enter => c = b'\r',
+                    EscKey::Backspace => c = 127,
+                    EscKey::Interrupt => c = 3,
+                    EscKey::Text(ch) => {
+                        let mut tmp = [0u8; 4];
+                        bytes.extend_from_slice(ch.encode_utf8(&mut tmp).as_bytes());
+                        let _ = write!(tty_w, "*");
+                        let _ = tty_w.flush();
+                        stars += 1;
                     }
+                    EscKey::Ignore => {}
+                }
+                if !matches!(key, EscKey::Enter | EscKey::Backspace | EscKey::Interrupt) {
                     continue;
                 }
-                marker.clear();
-                continue;
             }
 
             if !in_paste && matches!(c, b'\n' | b'\r') {
@@ -1021,6 +985,101 @@ fn read_secret_interactive(key: &str) -> Result<String> {
         bail!("empty value");
     }
     String::from_utf8(bytes).map_err(|_| anyhow!("input is not valid UTF-8"))
+}
+
+/// What a complete terminal escape sequence means to the secret prompt.
+#[derive(Debug, PartialEq)]
+enum EscKey {
+    PasteStart,
+    PasteEnd,
+    Enter,
+    Backspace,
+    Interrupt,
+    Text(char),
+    Ignore,
+}
+
+/// Decode an escape sequence starting with ESC. Returns `None` while the
+/// sequence is still incomplete.
+///
+/// Terminals with the kitty keyboard protocol enabled (Ghostty, Kitty, foot,
+/// WezTerm "disambiguate" mode, or a TUI that left it on) send Enter as
+/// `CSI 13 u` rather than `\r`. Treating that as unknown bytes used to leak
+/// `3u` into the value and the prompt would never submit.
+fn decode_escape(seq: &[u8]) -> Option<EscKey> {
+    const MAX_LEN: usize = 64;
+    match seq.get(1) {
+        None => None,
+        Some(b'[') => {
+            let last = *seq.last()?;
+            if seq.len() < 3 || !(0x40..=0x7e).contains(&last) {
+                // Parameter/intermediate bytes; give up on runaway input.
+                return (seq.len() >= MAX_LEN).then_some(EscKey::Ignore);
+            }
+            let body = std::str::from_utf8(&seq[2..seq.len() - 1]).unwrap_or("");
+            Some(decode_csi(body, last))
+        }
+        // SS3: ESC O <final> (application-mode arrows, keypad Enter).
+        Some(b'O') => match seq.get(2) {
+            None => None,
+            Some(b'M') => Some(EscKey::Enter),
+            Some(_) => Some(EscKey::Ignore),
+        },
+        // Alt+key or a lone ESC followed by something: drop it.
+        Some(_) => Some(EscKey::Ignore),
+    }
+}
+
+fn decode_csi(body: &str, final_byte: u8) -> EscKey {
+    let params: Vec<&str> = body.split(';').collect();
+    let sub =
+        |i: usize, j: usize| -> Option<u32> { params.get(i)?.split(':').nth(j)?.parse().ok() };
+    let (keycode, mods, event, text) = match final_byte {
+        b'~' if body == "200" => return EscKey::PasteStart,
+        b'~' if body == "201" => return EscKey::PasteEnd,
+        // xterm modifyOtherKeys: CSI 27 ; mods ; key ~
+        b'~' if sub(0, 0) == Some(27) && params.len() == 3 => {
+            (sub(2, 0), sub(1, 0).unwrap_or(1), 1, None)
+        }
+        // kitty keyboard protocol: CSI key[:alts] ; mods[:event] ; text u
+        b'u' => (
+            sub(0, 0),
+            sub(1, 0).unwrap_or(1),
+            sub(1, 1).unwrap_or(1),
+            params.get(2).map(|t| {
+                t.split(':')
+                    .filter_map(|cp| cp.parse::<u32>().ok().and_then(char::from_u32))
+                    .collect::<String>()
+            }),
+        ),
+        _ => return EscKey::Ignore,
+    };
+    let Some(keycode) = keycode else {
+        return EscKey::Ignore;
+    };
+    if event == 3 {
+        return EscKey::Ignore; // key release
+    }
+    let bits = mods.saturating_sub(1);
+    let (ctrl, alt) = (bits & 4 != 0, bits & 2 != 0);
+    match keycode {
+        13 | 57414 => EscKey::Enter, // Enter, keypad Enter
+        127 | 8 => EscKey::Backspace,
+        99 if ctrl => EscKey::Interrupt, // Ctrl-C
+        _ if ctrl || alt => EscKey::Ignore,
+        _ => {
+            if let Some(ch) = text.and_then(|t| t.chars().next()) {
+                return EscKey::Text(ch);
+            }
+            match char::from_u32(keycode) {
+                // Kitty encodes functional keys in the Unicode private use area.
+                Some(ch) if !ch.is_control() && !(57344..=63743).contains(&keycode) => {
+                    EscKey::Text(ch)
+                }
+                _ => EscKey::Ignore,
+            }
+        }
+    }
 }
 
 fn set_key_value(key: &str, value: &str, force: bool) -> Result<()> {
@@ -2992,4 +3051,51 @@ fn confirm_overwrite(key: &str) -> Result<bool> {
         .read_line(&mut line)
         .context("reading from /dev/tty")?;
     Ok(matches!(line.trim(), "y" | "Y" | "yes" | "YES"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{decode_escape, EscKey};
+
+    fn feed(seq: &[u8]) -> Option<EscKey> {
+        // Every strict prefix must be reported as incomplete.
+        for n in 1..seq.len() {
+            assert_eq!(decode_escape(&seq[..n]), None, "prefix {:?}", &seq[..n]);
+        }
+        decode_escape(seq)
+    }
+
+    #[test]
+    fn bracketed_paste_markers() {
+        assert_eq!(feed(b"\x1b[200~"), Some(EscKey::PasteStart));
+        assert_eq!(feed(b"\x1b[201~"), Some(EscKey::PasteEnd));
+    }
+
+    #[test]
+    fn kitty_protocol_enter_submits() {
+        assert_eq!(feed(b"\x1b[13u"), Some(EscKey::Enter));
+        assert_eq!(feed(b"\x1b[13;1u"), Some(EscKey::Enter));
+        assert_eq!(feed(b"\x1b[13;1:1u"), Some(EscKey::Enter));
+        assert_eq!(feed(b"\x1b[57414u"), Some(EscKey::Enter));
+        assert_eq!(feed(b"\x1b[13;1:3u"), Some(EscKey::Ignore)); // release
+        assert_eq!(feed(b"\x1b[27;1;13~"), Some(EscKey::Enter)); // modifyOtherKeys
+        assert_eq!(feed(b"\x1bOM"), Some(EscKey::Enter)); // keypad, SS3
+    }
+
+    #[test]
+    fn kitty_protocol_editing_keys() {
+        assert_eq!(feed(b"\x1b[127u"), Some(EscKey::Backspace));
+        assert_eq!(feed(b"\x1b[99;5u"), Some(EscKey::Interrupt));
+        assert_eq!(feed(b"\x1b[97u"), Some(EscKey::Text('a')));
+        assert_eq!(feed(b"\x1b[97;2;65u"), Some(EscKey::Text('A')));
+        assert_eq!(feed(b"\x1b[57441;2u"), Some(EscKey::Ignore)); // left shift
+    }
+
+    #[test]
+    fn other_sequences_are_dropped_whole() {
+        assert_eq!(feed(b"\x1b[A"), Some(EscKey::Ignore));
+        assert_eq!(feed(b"\x1b[1;5C"), Some(EscKey::Ignore));
+        assert_eq!(feed(b"\x1b[3~"), Some(EscKey::Ignore));
+        assert_eq!(feed(b"\x1bOA"), Some(EscKey::Ignore));
+    }
 }

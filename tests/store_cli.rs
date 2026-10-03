@@ -176,6 +176,34 @@ fn interactive_set_accepts_bracketed_multiline_paste() {
 }
 
 #[test]
+fn interactive_add_saves_on_kitty_protocol_enter() {
+    // Terminals with the kitty keyboard protocol active send Enter as CSI 13 u.
+    for (name, enter) in [
+        ("K_PLAIN", &b"\r"[..]),
+        ("K_CSI_U", &b"\x1b[13u"[..]),
+        ("K_CSI_U_MODS", &b"\x1b[13;1:1u"[..]),
+        ("K_MOK", &b"\x1b[27;1;13~"[..]),
+    ] {
+        let f = Fixture::inited();
+        let mut input = b"s3cr\x1b[127u\x1b[Ar3t".to_vec(); // backspace + arrow
+        input.extend_from_slice(enter);
+        let r = f.s_pty_input(&["add", name], &input);
+        assert_eq!(r.code, 0, "{name}: interactive add failed: {}", r.output);
+        assert!(r.output.contains(&format!("added {name}")), "{}", r.output);
+        let out = f.path("v");
+        f.s(&[
+            name,
+            "--",
+            "sh",
+            "-c",
+            &format!("printf %s \"${name}\" > {}", out.display()),
+        ])
+        .ok();
+        assert_eq!(f.read_str("v"), "s3cr3t", "{name}");
+    }
+}
+
+#[test]
 fn lower_case_key_exec() {
     let f = Fixture::inited();
     f.s_stdin(&["set", "lower_key", "--stdin"], "hello").ok();
@@ -384,85 +412,67 @@ fn export_import_roundtrip_special_chars() {
     assert_eq!(String::from_utf8(f2.read("out")).unwrap(), value);
 }
 
-// --- Defect 6: import updates the store that already holds the key ----------
+// --- No global store: ~/.config/senv/senv is never read or written ---------
 
 #[test]
-fn import_updates_global_store() {
+fn global_store_is_ignored() {
     let f = Fixture::new();
     let home_str = f.dir().to_str().unwrap();
     let global = f.path(".config/senv/senv");
     let global_str = global.to_str().unwrap();
-    let local = f.path(".senv");
-    let local_str = local.to_str().unwrap();
 
-    // 1. Create a global store and put a key in it.
-    f.s_env(
-        &["init"],
-        &[("S_FILE", Some(global_str)), ("XDG_CONFIG_HOME", None)],
-        None,
-    )
-    .ok();
+    // A store at the old global location holding GKEY.
+    f.s_env(&["init"], &[("S_FILE", Some(global_str))], None)
+        .ok();
     f.s_env(
         &["set", "GKEY", "--stdin"],
-        &[("S_FILE", Some(global_str)), ("XDG_CONFIG_HOME", None)],
-        Some("old_val"),
+        &[("S_FILE", Some(global_str))],
+        Some("global_val"),
     )
     .ok();
 
-    // 2. Create a local .senv (so both stores exist for the merge).
-    f.s_env(
-        &["init"],
-        &[("S_FILE", Some(local_str)), ("XDG_CONFIG_HOME", None)],
+    // Without a local .senv, `s` does not fall back to it.
+    let env = [("S_FILE", None), ("HOME", Some(home_str))];
+    let r = f.s_env(&["list"], &env, None);
+    assert!(r.stderr.contains("no .senv here"), "{}", r.stderr);
+    assert!(!r.stdout.contains("GKEY"));
+    let r = f.s_env(&["GKEY", "--", "true"], &env, None);
+    r.fails();
+    assert!(r.stderr.contains("run `s init`"), "{}", r.stderr);
+
+    // With a local .senv, the global key is invisible and new keys go local.
+    f.s(&["init"]).ok();
+    let r = f.s_env(
+        &["GKEY", "--", "true"],
+        &[("S_FILE", None), ("HOME", Some(home_str))],
         None,
-    )
-    .ok();
-
-    // 3. Import --from-env GKEY with merge mode (S_FILE unset, HOME set).
-    //    The key lives only in the global store, so it must be UPDATED there,
-    //    not duplicated into the local store.
+    );
+    r.fails();
     f.s_env(
         &["import", "--from-env", "GKEY"],
         &[
             ("S_FILE", None),
             ("HOME", Some(home_str)),
-            ("XDG_CONFIG_HOME", None),
-            ("GKEY", Some("new_val")),
+            ("GKEY", Some("local_val")),
         ],
         None,
     )
     .ok();
-
-    // The local store must not contain GKEY.
-    let local = String::from_utf8(f.read(".senv")).unwrap();
-    assert!(
-        !local.contains("GKEY"),
-        "GKEY should not be duplicated in the local store"
-    );
-
-    // The global store must contain GKEY with the updated value.
+    assert!(String::from_utf8(f.read(".senv")).unwrap().contains("GKEY"));
     let out = f.path("out");
-    let out_str = out.to_str().unwrap();
     f.s_env(
         &[
             "GKEY",
             "--",
             "sh",
             "-c",
-            &format!("printf %s \"$GKEY\" > {out_str}"),
+            &format!("printf %s \"$GKEY\" > {}", out.display()),
         ],
-        &[
-            ("S_FILE", None),
-            ("HOME", Some(home_str)),
-            ("XDG_CONFIG_HOME", None),
-        ],
+        &[("S_FILE", None), ("HOME", Some(home_str))],
         None,
     )
     .ok();
-    assert_eq!(
-        String::from_utf8(f.read("out")).unwrap(),
-        "new_val",
-        "global store should have the updated value"
-    );
+    assert_eq!(String::from_utf8(f.read("out")).unwrap(), "local_val");
 }
 
 // --- Defect 7: import --from-env NAME honours -f ----------------------------
