@@ -35,14 +35,16 @@ description: Use when you need to use credentials and the project uses an .senv.
 
 ## Execute with credentials
 
-Name only the credentials the command needs:
+Name only the credentials the command needs. `*` and `?` select stored names:
 
 ```sh
 s API_KEY -- command arg
 s API_KEY DB_URL -- command arg
+s 'CRABBOX_*' -- command arg
 ```
 
-Use `s --all -- command arg` only when the command needs every stored credential.
+Quote wildcards so the shell does not expand them. Use `s --all -- command arg`
+only when the command needs every stored credential.
 `s` injects the selected names into the child environment and redacts their
 literal values from terminal output.
 
@@ -55,16 +57,6 @@ Put the required credential names in the shebang:
 import os
 token = os.environ["API_KEY"]
 ```
-
-For a fixed `s` installation path:
-
-```sh
-#!/usr/local/bin/s API_KEY DB_URL -- bash
-curl -H "Authorization: Bearer $API_KEY" "$DB_URL"
-```
-
-Make the script executable, then run it directly. `s` injects the named
-credentials before starting the interpreter.
 
 ## HTTP requests
 
@@ -195,12 +187,11 @@ fn run() -> Result<()> {
         if names.is_empty() {
             return cmd_exec(cmd_args, Some(&[]));
         }
-        // Every pre-`--` name must be a valid key name (letters, digits,
-        // underscore). Report which one and why instead of falling through
-        // to "unknown command".
+        // Every pre-`--` name must be a key or a `*` / `?` glob over keys.
+        // Report which one and why instead of falling through to "unknown command".
         for n in names {
-            if !store::valid_key_name(n) {
-                bail!("not a valid key name: {n:?} (letters, digits, underscore only)");
+            if !store::valid_key_selector(n) {
+                bail!("not a valid key name: {n:?} (letters, digits, underscore, * and ?)");
             }
         }
         return cmd_exec(cmd_args, Some(names));
@@ -234,7 +225,7 @@ fn print_usage() {
 s — encrypted env store. your agent doesn't need to know your secrets.
 
 Agents:
-  s KEY [KEY...] -- <cmd>       run a command with only the named credentials
+  s KEY [KEY...] -- <cmd>       named credentials; quote KEY* / KEY? globs
   s configure HOST --header 'Name: $KEY'
                                 attach headers using a stored key to a domain
   s curl [options] <URL>        use domain-scoped credentials for HTTP
@@ -2121,17 +2112,52 @@ fn cmd_exec(cmd_args: &[String], only: Option<&[String]>) -> Result<()> {
     ensure_store()?;
     // Resolve only the requested secrets. Never derive an unrequested key:
     // Argon2id is ~18ms each, and a corrupt or foreign-password entry must not
-    // abort an invocation that never asked for it.
-    if let Some(names) = only {
-        let merged = merged_keys()?;
-        for name in names {
-            if !merged.contains_key(name) {
-                bail!("secret {name} not found. add it: s set {name}");
+    // abort an invocation that never asked for it. Wildcards expand against
+    // stored names first so a miss fails before the password prompt.
+    let entries = match only {
+        Some(selectors) => {
+            let merged = merged_keys()?;
+            let names = expand_key_selectors(&merged, selectors)?;
+            decrypt_from_keys(&merged, Some(&names))?
+        }
+        None => decrypt_selected(None)?,
+    };
+    run_scrubbed(cmd_args, &entries, &entries)
+}
+
+/// Exact names must exist; `*` / `?` globs must match at least one stored key.
+/// Order follows the selectors, then stored-name order within a glob. Duplicates
+/// from overlapping selectors are dropped.
+fn expand_key_selectors(
+    keys: &std::collections::BTreeMap<String, store::KeyEntry>,
+    selectors: &[String],
+) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for selector in selectors {
+        if store::is_wildcard_selector(selector) {
+            let matched: Vec<String> = keys
+                .keys()
+                .filter(|name| store::key_selector_matches(selector, name))
+                .cloned()
+                .collect();
+            if matched.is_empty() {
+                bail!("no secrets match {selector:?}");
             }
+            for name in matched {
+                if seen.insert(name.clone()) {
+                    out.push(name);
+                }
+            }
+        } else if keys.contains_key(selector) {
+            if seen.insert(selector.clone()) {
+                out.push(selector.clone());
+            }
+        } else {
+            bail!("secret {selector} not found. add it: s set {selector}");
         }
     }
-    let entries = decrypt_selected(only)?;
-    run_scrubbed(cmd_args, &entries, &entries)
+    Ok(out)
 }
 
 /// Run a child while redacting `scrub_entries` from every output path.

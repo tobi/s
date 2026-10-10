@@ -424,10 +424,60 @@ pub fn write_private(path: &Path, data: &[u8]) -> Result<()> {
 // --- Validation -----------------------------------------------------------
 
 pub fn valid_key_name(k: &str) -> bool {
+    key_chars_ok(k, false)
+}
+
+/// Exec-form selector: a stored key name, or a `*` / `?` glob over those names.
+pub fn valid_key_selector(k: &str) -> bool {
+    key_chars_ok(k, true)
+}
+
+fn key_chars_ok(k: &str, allow_wildcards: bool) -> bool {
     let mut cs = k.chars();
     let Some(first) = cs.next() else { return false };
-    (first.is_ascii_alphabetic() || first == '_')
-        && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    let first_ok = first.is_ascii_alphabetic()
+        || first == '_'
+        || (allow_wildcards && matches!(first, '*' | '?'));
+    first_ok
+        && k.chars().all(|c| {
+            c.is_ascii_alphanumeric()
+                || c == '_'
+                || (allow_wildcards && matches!(c, '*' | '?'))
+        })
+}
+
+pub fn is_wildcard_selector(k: &str) -> bool {
+    k.bytes().any(|b| b == b'*' || b == b'?')
+}
+
+/// Shell-style match: `*` any sequence, `?` any single character.
+pub fn key_selector_matches(selector: &str, name: &str) -> bool {
+    glob_match(selector.as_bytes(), name.as_bytes())
+}
+
+fn glob_match(pat: &[u8], name: &[u8]) -> bool {
+    let mut pi = 0;
+    let mut ni = 0;
+    let mut star = None;
+    while ni < name.len() {
+        if pi < pat.len() && (pat[pi] == b'?' || pat[pi] == name[ni]) {
+            pi += 1;
+            ni += 1;
+        } else if pi < pat.len() && pat[pi] == b'*' {
+            star = Some((pi, ni));
+            pi += 1;
+        } else if let Some((sp, sn)) = star {
+            pi = sp + 1;
+            ni = sn + 1;
+            star = Some((sp, ni));
+        } else {
+            return false;
+        }
+    }
+    while pi < pat.len() && pat[pi] == b'*' {
+        pi += 1;
+    }
+    pi == pat.len()
 }
 
 // --- Time -----------------------------------------------------------------
@@ -736,6 +786,40 @@ domains:
         assert!(!valid_key_name("1ABC"));
         assert!(!valid_key_name("HAS-DASH"));
         assert!(!valid_key_name("HAS SPACE"));
+    }
+
+    #[test]
+    fn valid_key_selectors() {
+        assert!(valid_key_selector("API_KEY"));
+        assert!(valid_key_selector("CRABBOX_*"));
+        assert!(valid_key_selector("*"));
+        assert!(valid_key_selector("?"));
+        assert!(valid_key_selector("*_TOKEN"));
+        assert!(valid_key_selector("A?B"));
+        assert!(!valid_key_selector(""));
+        assert!(!valid_key_selector("1ABC"));
+        assert!(!valid_key_selector("HAS-DASH"));
+        assert!(!valid_key_selector("HAS SPACE"));
+        assert!(!valid_key_name("CRABBOX_*"));
+    }
+
+    #[test]
+    fn key_selector_glob_match() {
+        assert!(key_selector_matches("CRABBOX_*", "CRABBOX_FOO"));
+        assert!(key_selector_matches("CRABBOX_*", "CRABBOX_"));
+        assert!(key_selector_matches("CRABBOX_*", "CRABBOX_A_B"));
+        assert!(!key_selector_matches("CRABBOX_*", "CRABBOX"));
+        assert!(!key_selector_matches("CRABBOX_*", "OTHER_FOO"));
+        assert!(key_selector_matches("*_TOKEN", "GH_TOKEN"));
+        assert!(key_selector_matches("*", "ANY_KEY"));
+        assert!(key_selector_matches("A?C", "ABC"));
+        assert!(!key_selector_matches("A?C", "AC"));
+        assert!(!key_selector_matches("A?C", "ABBC"));
+        assert!(key_selector_matches("A*C", "AC"));
+        assert!(key_selector_matches("A*C", "ABBC"));
+        assert!(key_selector_matches("**", "X"));
+        assert!(!key_selector_matches("API_KEY", "API_KEY2"));
+        assert!(key_selector_matches("API_KEY", "API_KEY"));
     }
 
     #[test]

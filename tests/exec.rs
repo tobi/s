@@ -54,6 +54,70 @@ fn empty_only_injects_nothing() {
     );
 }
 
+/// `s 'CRABBOX_*' -- cmd` injects every matching secret and nothing else.
+#[test]
+fn wildcard_injects_matching_secrets_only() {
+    let f = Fixture::inited();
+    f.set("CRABBOX_FOO", "alpha-secret-aaaa");
+    f.set("CRABBOX_BAR", "beta-secret-bbbb");
+    f.set("OTHER_KEY", "gamma-secret-cccc");
+    let r = f.s(&[
+        "CRABBOX_*",
+        "--",
+        "sh",
+        "-c",
+        "echo FOO=${CRABBOX_FOO:+present}; echo BAR=${CRABBOX_BAR:+present}; echo OTHER=${OTHER_KEY:+present}",
+    ]);
+    let out = r.out();
+    assert_eq!(r.code, 0, "{}", r.all());
+    assert!(out.contains("FOO=present"), "CRABBOX_FOO injected: {out}");
+    assert!(out.contains("BAR=present"), "CRABBOX_BAR injected: {out}");
+    assert!(
+        !out.contains("OTHER=present"),
+        "non-matching secret must not be injected: {out}"
+    );
+}
+
+/// A glob that matches nothing fails before the command runs.
+#[test]
+fn unmatched_wildcard_fails() {
+    let f = Fixture::inited();
+    f.set("API_KEY", "alpha-secret-aaaa");
+    let r = f.s(&["CRABBOX_*", "--", "sh", "-c", "echo ran"]);
+    r.fails();
+    assert!(
+        r.stderr.contains("no secrets match"),
+        "missing glob must be reported: {}",
+        r.stderr
+    );
+    assert!(
+        !r.out().contains("ran"),
+        "command must not run on a miss: {}",
+        r.out()
+    );
+}
+
+/// Exact names still work next to a glob; overlapping names inject once.
+#[test]
+fn wildcard_and_exact_name_dedup() {
+    let f = Fixture::inited();
+    f.set("CRABBOX_FOO", "alpha-secret-aaaa");
+    f.set("API_KEY", "beta-secret-bbbb");
+    let r = f.s(&[
+        "API_KEY",
+        "CRABBOX_*",
+        "CRABBOX_FOO",
+        "--",
+        "sh",
+        "-c",
+        "echo API=${API_KEY:+present}; echo FOO=${CRABBOX_FOO:+present}",
+    ]);
+    let out = r.out();
+    assert_eq!(r.code, 0, "{}", r.all());
+    assert!(out.contains("API=present"), "exact name injected: {out}");
+    assert!(out.contains("FOO=present"), "glob match injected: {out}");
+}
+
 /// A corrupt / foreign-password entry must NOT break `s GOOD_KEY -- cmd`. The
 /// old code called decrypt_all() and aborted on the mismatched entry. BAD_KEY is
 /// encrypted under a different password in a second store, then its blob is

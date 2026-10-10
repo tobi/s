@@ -39,13 +39,14 @@ s list                          # list names ([REDACTED] values)
 ```bash
 s API_KEY -- curl https://...                    # specific secrets
 s API_KEY DB_URL -- ./deploy.sh                  # multiple secrets
+s 'CRABBOX_*' -- crabbox                         # wildcard over stored names
 s --all -- ./deploy.sh                           # ALL secrets (explicit)
 s -- ./build.sh                                  # no secrets injected
 ```
 
 Secrets are injected as env vars. Output is scrubbed — any secret value replaced
 with `[REDACTED]`. Injecting **all** secrets is never the default: name the keys
-you need, or opt in explicitly with `--all`.
+you need, use a quoted `*` / `?` glob (`CRABBOX_*`), or opt in with `--all`.
 
 Scrubbing is verbatim-only: it catches the secret as written, not transformed
 copies (base64, URL-encoding, etc.). It's a strong guardrail, not a guarantee.
@@ -191,7 +192,7 @@ The encryption password is resolved in order:
 
 - `s get` and `s export` **refuse without a TTY** — prevents secrets leaking into agent context
 - `s list` only shows names with `[REDACTED]`
-- `s KEY -- cmd` / `s --all -- cmd` inject secrets but scrub stdout, stderr, and PTY output
+- `s KEY -- cmd` / `s 'KEY*' -- cmd` / `s --all -- cmd` inject secrets but scrub stdout, stderr, and PTY output
 - `s curl` works without a TTY, restricts credentials to configured domains, keeps them out of argv/environment, and scrubs responses
 - `s --skill` prints concise agent instructions for exec, shebang scripts, and domain-scoped curl
 - Dangerous loader/interpreter names such as `LD_PRELOAD`, `DYLD_*`, `PATH`, and `S_KEY` are rejected on import/set and never injected
